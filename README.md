@@ -5,7 +5,7 @@ Department of Electrical and Computer Engineering
 University of Illinois Urbana-Champaign
 dorbala2@illinois.edu
 
-> Preprint: Under Review, Machine Learning for Healthcare (MLHC) 2025
+> Preprint: Under Review
 
 ---
 
