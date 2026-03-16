@@ -2,15 +2,32 @@
 """
 Emission Functions: CircAdapt + Hallow → ARIC Echocardiographic & Renal Variables
 ==================================================================================
+Paper Section 3.6: Clinical Emission Functions
+
+This module implements the clinical emission layer (Section 3.6 of Dorbala 2025),
+which maps internal CircAdapt waveforms and Hallow renal outputs to 113 ARIC-
+compatible clinical variables. This is the bridge between the latent disease state
+(simulator parameters) and observable clinical measurements, analogous to the
+observation model in a hidden Markov model or state-space formulation.
 
 Generates synthetic echocardiographic, Doppler, tissue-Doppler, speckle-tracking,
 and renal-health variables matching the measurement protocol of ARIC visits 5
 (2011-2013) and 7 (2018-2019).
 
-Every function documents:
-  • The ARIC variable name and units
-  • The physiological derivation from CircAdapt signals and/or Hallow renal outputs
-  • The published reference equations or normal ranges
+Every emit_* function documents:
+  - The ARIC variable name and units
+  - The physiological derivation from CircAdapt signals and/or Hallow renal outputs
+  - The published reference equations or normal ranges
+
+Variable categories (8 groups, 113 total):
+  - LV structure (7): LVIDd, LVIDs, IVSd, LVPWd, LV mass, RWT
+  - LV systolic function (6): LVEDV, LVESV, LVEF, SV, CO, GLS
+  - Diastolic function (13): E, A, E/A, DT, IVRT, e', a', s', E/e'
+  - Atrial/RV (20): LA volume/strain, RV volumes, TAPSE, PASP
+  - Hemodynamics (6): SBP, DBP, MAP, heart rate, pulse pressure
+  - Vascular (5): arterial compliance, PWV, VA coupling
+  - Renal/lab (16): GFR, eGFR, creatinine, UACR, NT-proBNP, troponin
+  - Indexed (9): body-size normalized versions
 
 Sources:
   CircAdapt components used:
@@ -24,7 +41,7 @@ Sources:
     Wall     — Am (midwall area)
     TriSeg   — signals for septal interaction
 
-  Hallow renal model outputs:
+  Hallow renal model outputs (from cardiorenal_coupling.py):
     GFR, RBF, P_glom, Na_excretion, water_excretion, V_blood, C_Na
 
 Usage:
@@ -32,23 +49,32 @@ Usage:
     from emission_functions import extract_all_aric_variables
 
     model = VanOsta2024()
-    model.run(stable=True)
-    model.run(1)  # store 1 beat
+    model.run(stable=True)  # solve to hemodynamic steady state
+    model.run(1)            # store 1 beat for waveform extraction
 
-    renal_state = {...}  # from Hallow model update
+    renal_state = {...}     # from Hallow model update
 
     variables = extract_all_aric_variables(model, renal_state)
+    # Returns dict with 113 ARIC-compatible clinical variables
+
+References:
+    - Dorbala 2025, Section 3.6 (Clinical Emission Functions)
+    - CircAdapt: van Osta et al., EHJ-DH, 2024
+    - Hallow et al., CPT:PSP, 6(1):48-57, 2017
+    - ASE guidelines for echocardiographic measurements
 """
 
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
-# ── Constants ───────────────────────────────────────────────────────────────
-PA_TO_MMHG = 7.5e-3
-M3_TO_ML = 1e6
-ML_TO_M3 = 1e-6
-M3S_TO_MLS = 1e6  # m³/s → mL/s
+# ── Unit Conversion Constants ───────────────────────────────────────────────
+# CircAdapt uses SI units internally (Pa, m³, m³/s).
+# Clinical measurements use mmHg, mL, mL/s.
+PA_TO_MMHG = 7.5e-3    # 1 Pa = 7.5e-3 mmHg (pressure conversion)
+M3_TO_ML = 1e6          # 1 m³ = 1e6 mL (volume conversion)
+ML_TO_M3 = 1e-6         # 1 mL = 1e-6 m³ (inverse volume conversion)
+M3S_TO_MLS = 1e6        # 1 m³/s = 1e6 mL/s (flow conversion)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -57,49 +83,73 @@ M3S_TO_MLS = 1e6  # m³/s → mL/s
 
 def _get_waveforms(model) -> Dict[str, np.ndarray]:
     """
-    Pull all needed time-series from a CircAdapt model that has
-    already run at least 1 stored beat.
+    Extract all raw time-series waveforms from a CircAdapt VanOsta2024 model.
 
-    Returns arrays in clinical units (mmHg, mL, mL/s, ms).
+    This is the core data extraction function. CircAdapt stores one full cardiac
+    cycle of pressure, volume, and flow waveforms after model.run(1). We pull
+    these waveforms and convert from SI units to clinical units.
+
+    The extracted waveforms are used by all 17 emit_* functions to compute
+    ARIC-compatible clinical variables.
+
+    Parameters
+    ----------
+    model : circadapt.VanOsta2024
+        Must have run at least 1 stored beat (model.run(1) after stable).
+
+    Returns
+    -------
+    dict : Waveform arrays in clinical units (mmHg, mL, mL/s, ms).
+        Keys: t, t_ms, dt, t_cycle, p_lv, p_rv, p_la, p_ra, p_ao, p_sv,
+              p_pa, p_pv, V_lv, V_rv, V_la, V_ra, q_mv, q_av, q_tv, q_pv,
+              q_sys, q_pul, Ef_all, Sf_all, ls_all
     """
-    t = model['Solver']['t']  # seconds
-    dt = np.median(np.diff(t)) if len(t) > 1 else 0.002
-    t_ms = t * 1e3
+    # Time vector from CircAdapt's ODE solver (one stored cardiac cycle)
+    t = model['Solver']['t']  # seconds — typically ~0.8s for 75 bpm
+    dt = np.median(np.diff(t)) if len(t) > 1 else 0.002  # time step ~2ms
+    t_ms = t * 1e3  # convert to milliseconds for clinical timing measurements
 
     # ── Pressures [mmHg] ────────────────────────────────────────────────
-    p_lv    = model['Cavity']['p'][:, 'cLv']  * PA_TO_MMHG
-    p_rv    = model['Cavity']['p'][:, 'cRv']  * PA_TO_MMHG
-    p_la    = model['Cavity']['p'][:, 'La']   * PA_TO_MMHG
-    p_ra    = model['Cavity']['p'][:, 'Ra']   * PA_TO_MMHG
-    p_ao    = model['Cavity']['p'][:, 'SyArt'] * PA_TO_MMHG
-    p_sv    = model['Cavity']['p'][:, 'SyVen'] * PA_TO_MMHG
-    p_pa    = model['Cavity']['p'][:, 'PuArt'] * PA_TO_MMHG
-    p_pv    = model['Cavity']['p'][:, 'PuVen'] * PA_TO_MMHG
+    # CircAdapt Cavity pressures: 4 cardiac chambers + 4 vascular compartments
+    # Used for: BP, filling pressures, pulmonary pressures, PV loops
+    p_lv    = model['Cavity']['p'][:, 'cLv']  * PA_TO_MMHG   # left ventricle
+    p_rv    = model['Cavity']['p'][:, 'cRv']  * PA_TO_MMHG   # right ventricle
+    p_la    = model['Cavity']['p'][:, 'La']   * PA_TO_MMHG   # left atrium
+    p_ra    = model['Cavity']['p'][:, 'Ra']   * PA_TO_MMHG   # right atrium
+    p_ao    = model['Cavity']['p'][:, 'SyArt'] * PA_TO_MMHG  # systemic arterial (aorta)
+    p_sv    = model['Cavity']['p'][:, 'SyVen'] * PA_TO_MMHG  # systemic venous (CVP proxy)
+    p_pa    = model['Cavity']['p'][:, 'PuArt'] * PA_TO_MMHG  # pulmonary arterial
+    p_pv    = model['Cavity']['p'][:, 'PuVen'] * PA_TO_MMHG  # pulmonary venous
 
     # ── Volumes [mL] ───────────────────────────────────────────────────
-    V_lv    = model['Cavity']['V'][:, 'cLv']  * M3_TO_ML
-    V_rv    = model['Cavity']['V'][:, 'cRv']  * M3_TO_ML
-    V_la    = model['Cavity']['V'][:, 'La']   * M3_TO_ML
-    V_ra    = model['Cavity']['V'][:, 'Ra']   * M3_TO_ML
+    # CircAdapt Cavity volumes: used for EDV, ESV, EF, stroke volume, PV loops
+    V_lv    = model['Cavity']['V'][:, 'cLv']  * M3_TO_ML   # LV volume waveform
+    V_rv    = model['Cavity']['V'][:, 'cRv']  * M3_TO_ML   # RV volume waveform
+    V_la    = model['Cavity']['V'][:, 'La']   * M3_TO_ML   # LA volume (for LAVi)
+    V_ra    = model['Cavity']['V'][:, 'Ra']   * M3_TO_ML   # RA volume
 
     # ── Valve flows [mL/s] ─────────────────────────────────────────────
-    # Object order: SyVenRa, RaRv, RvPuArt, PuVenLa, LaLv, LvSyArt
-    q_all = model['Valve']['q'] * M3S_TO_MLS  # shape (ntime, nvalves)
-    q_tv  = q_all[:, 1]   # tricuspid  (RaRv)
-    q_pv  = q_all[:, 2]   # pulmonic   (RvPuArt)
-    q_mv  = q_all[:, 4]   # mitral     (LaLv)
-    q_av  = q_all[:, 5]   # aortic     (LvSyArt)
+    # CircAdapt models 6 valves in fixed order; we extract the 4 cardiac valves
+    # Used for: Doppler velocities, cardiac output, regurgitation assessment
+    q_all = model['Valve']['q'] * M3S_TO_MLS  # shape (ntime, 6)
+    q_tv  = q_all[:, 1]   # tricuspid valve flow (RA→RV) — for TV Doppler
+    q_pv  = q_all[:, 2]   # pulmonic valve flow (RV→PA) — for PV Doppler
+    q_mv  = q_all[:, 4]   # mitral valve flow (LA→LV) — for E/A, DT, IVRT
+    q_av  = q_all[:, 5]   # aortic valve flow (LV→Aorta) — for LVOT VTI, AV gradients
 
     # ── ArtVen flows [mL/s] ────────────────────────────────────────────
-    q_sys = model['ArtVen']['q'][:, 0] * M3S_TO_MLS  # systemic (index 0 = Sy)
-    q_pul = model['ArtVen']['q'][:, 1] * M3S_TO_MLS  # pulmonary (index 1 = Pu)
+    # Arteriovenous bed flows — used for cardiac output calculation
+    q_sys = model['ArtVen']['q'][:, 0] * M3S_TO_MLS  # systemic bed flow
+    q_pul = model['ArtVen']['q'][:, 1] * M3S_TO_MLS  # pulmonary bed flow
 
-    # ── Patch signals ──────────────────────────────────────────────────
-    # Patch objects: pLa0, pRa0, pLv0, pSv0, pRv0 (typical order)
-    Ef_all = model['Patch']['Ef']     # natural fiber strain
-    Sf_all = model['Patch']['Sf']     # total fiber stress [Pa]
-    ls_all = model['Patch']['l_s']    # sarcomere length [µm]
+    # ── Patch signals (sarcomere-level mechanics) ──────────────────────
+    # Patch objects represent myocardial wall segments: pLa0, pRa0, pLv0, pSv0, pRv0
+    # These are essential for strain, tissue Doppler, and myocardial work calculations
+    Ef_all = model['Patch']['Ef']     # natural (Green) fiber strain — for GLS
+    Sf_all = model['Patch']['Sf']     # total fiber stress [Pa] — for myocardial work
+    ls_all = model['Patch']['l_s']    # sarcomere length [µm] — for tissue velocities
 
+    # Cardiac cycle duration (determines heart rate: HR = 60/t_cycle)
     t_cycle = float(model['General']['t_cycle'])
 
     return dict(
@@ -114,7 +164,7 @@ def _get_waveforms(model) -> Dict[str, np.ndarray]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 1: LV Structure
+# SECTION 1: LV Structure  [Paper Section 3.6, Category: LV structure (7 variables)]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC variables: LVIDd, LVIDs, IVSd, LVPWd, LV mass, LVMi, RWT
 
@@ -189,7 +239,7 @@ def emit_LV_structure(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2: LV Volumes and Systolic Function
+# SECTION 2: LV Volumes and Systolic Function  [Paper Section 3.6, Category: LV systolic (6 variables)]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: LVEDV, LVESV, LVEF, SV, CO, GLS, fractional shortening
 
@@ -249,7 +299,7 @@ def emit_LV_systolic(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 3: Doppler — Mitral Inflow (Diastolic Function)
+# SECTION 3: Doppler — Mitral Inflow (Diastolic Function)  [Paper Section 3.6, Diastolic function]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: E wave, A wave, E/A ratio, DT, IVRT
 
@@ -331,7 +381,7 @@ def emit_mitral_inflow_doppler(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4: Tissue Doppler Imaging (TDI)
+# SECTION 4: Tissue Doppler Imaging (TDI)  [Paper Section 3.6, Diastolic function]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: e' (septal, lateral), s', E/e', a'
 
@@ -410,7 +460,7 @@ def emit_tissue_doppler(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5: E/e' Ratio and Filling Pressure Estimation
+# SECTION 5: E/e' and Filling Pressure Estimation  [Paper Section 3.6, key HFpEF marker]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: E/e' (septal, lateral, average), LAP estimate
 
@@ -450,7 +500,7 @@ def emit_filling_pressures(mitral: Dict, tdi: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6: LA Size and Function
+# SECTION 6: LA Size and Function  [Paper Section 3.6, Atrial/RV category]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: LAVi (biplane), LA diameter, LA reservoir strain (LARS)
 
@@ -525,7 +575,7 @@ def emit_LA(model, w: Dict, BSA: float = 1.9) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7: RV Structure and Function
+# SECTION 7: RV Structure and Function  [Paper Section 3.6, Atrial/RV category]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: RV diameter, TAPSE, RV s', RVFAC, RV free wall strain
 
@@ -602,7 +652,7 @@ def emit_RV(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8: Aortic Doppler and Hemodynamics
+# SECTION 8: Aortic Doppler and Hemodynamics  [Paper Section 3.6, Hemodynamics]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: LVOT VTI, LVOT diameter, aortic valve Vmax, mean gradient, AVA
 
@@ -675,7 +725,7 @@ def emit_aortic_doppler(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9: Pulmonary Pressures
+# SECTION 9: Pulmonary Pressures  [Paper Section 3.6, Hemodynamics]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: PASP (from TR jet), TR Vmax, mean PAP estimate
 
@@ -731,7 +781,7 @@ def emit_pulmonary_pressures(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 10: Blood Pressure (Brachial — from aortic waveform)
+# SECTION 10: Blood Pressure  [Paper Section 3.6, Hemodynamics — H→K message source]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: SBP, DBP, pulse pressure, MAP, heart rate
 
@@ -960,7 +1010,7 @@ def emit_diastolic_grade(mitral: Dict, tdi: Dict, filling: Dict,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 15: Vascular (Arterial Stiffness Surrogates)
+# SECTION 15: Vascular (Arterial Stiffness Surrogates)  [Paper Section 3.6, Vascular category]
 # ═══════════════════════════════════════════════════════════════════════════
 
 def emit_vascular(model, w: Dict) -> Dict:
@@ -1027,7 +1077,7 @@ def emit_vascular(model, w: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 16: Renal Health Variables
+# SECTION 16: Renal Health Variables  [Paper Section 3.6, Renal/lab — from Hallow model]
 # ═══════════════════════════════════════════════════════════════════════════
 # ARIC: eGFR (CKD-EPI creatinine, cystatin C), UACR, serum creatinine,
 #       cystatin C, BUN, serum Na, K, blood volume
@@ -1160,7 +1210,7 @@ def emit_renal(renal_state: Dict, age: float = 75.0, sex: str = 'M',
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 17: Indexing to Body Size
+# SECTION 17: Indexing to Body Size  [Paper Section 3.6, Indexed category]
 # ═══════════════════════════════════════════════════════════════════════════
 
 def emit_indexed(structure: Dict, systolic: Dict,
