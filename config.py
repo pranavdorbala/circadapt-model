@@ -1662,3 +1662,360 @@ SAMPLING_CONFIG = {
     # Diabetes annual rate for non-diabetic patients (slow acquisition):
     'd_annual_rate_low': (0.005, 0.002, 0.001, 0.015),
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Core 20 Clinical Variables for Monthly Synthetic Cohort
+# ═══════════════════════════════════════════════════════════════════════════════
+# (Paper Section 3.6 — Emission Functions, Monthly Resolution)
+#
+# Each variable maps to a specific ARIC codebook field.
+# V5 = Visit 5 (2011-2013, N≈6118), V7 = Visit 7 (2018-2019, N≈3065)
+# Stats are (mean, sd) from the ARIC Echo Codebooks unless noted.
+
+CORE_20_VARIABLES = {
+    # ===== LV STRUCTURE (2) =====
+    "LVIDd_cm": {
+        "description": "LV end-diastolic internal diameter",
+        "unit": "cm",
+        "aric_field_v5": "ECH.ECH4 (LVEDD)",
+        "aric_field_v7": "ECH.ECH4 (LVEDD)",
+        "v5_mean": 4.415, "v5_sd": 0.525, "v5_n": 6069, "v5_missing_pct": 0.8,
+        "v7_mean": 4.323, "v7_sd": 0.520, "v7_n": 2998, "v7_missing_pct": 2.2,
+        "v5_range": (2.67, 8.68), "v7_range": (2.30, 7.06),
+        "distribution": "normal",
+        "clinical_weight": 0.5,
+        "physiological_bounds": (2.5, 8.0),
+        "emission_eq": "Eq.49: 2*(3*EDV/(4*pi))^(1/3)",
+        "emission_source": "CircAdapt EDV",
+    },
+    "LVmass_g": {
+        "description": "LV mass",
+        "unit": "g",
+        "aric_field_v5": "ECH.ECH11 (LVM)",
+        "aric_field_v7": "ECH.ECH11 (LVM)",
+        "v5_mean": 150.043, "v5_sd": 46.674, "v5_n": 6067, "v5_missing_pct": 0.8,
+        "v7_mean": 152.969, "v7_sd": 46.576, "v7_n": 2986, "v7_missing_pct": 2.6,
+        "v5_range": (56.31, 484.33), "v7_range": (37.94, 445.03),
+        "distribution": "normal",
+        "clinical_weight": 0.5,
+        "physiological_bounds": (50, 500),
+        "emission_eq": "Eq.53: ASE cube formula from LVIDd, IVSd, LVPWd",
+        "emission_source": "CircAdapt wall volumes + cavity dimensions",
+    },
+    # ===== LV SYSTOLIC FUNCTION (3) =====
+    "LVEF_pct": {
+        "description": "LV ejection fraction",
+        "unit": "%",
+        "aric_field_v5": "ECH.ECH10 (LVEF)",
+        "aric_field_v7": "ECH.ECH10 (LVEF)",
+        "v5_mean": 65.06, "v5_sd": 6.86, "v5_n": 5919, "v5_missing_pct": 3.3,
+        "v7_mean": 63.16, "v7_sd": 7.37, "v7_n": 2893, "v7_missing_pct": 5.6,
+        "v5_range": (22.8, 86.3), "v7_range": (14.0, 81.3),
+        "distribution": "normal",
+        "clinical_weight": 1.0,
+        "physiological_bounds": (10, 85),
+        "emission_eq": "Eq.58: (EDV-ESV)/EDV * 100",
+        "emission_source": "CircAdapt EDV, ESV",
+    },
+    "GLS_pct": {
+        "description": "Average peak longitudinal strain (negative = normal)",
+        "unit": "%",
+        "aric_field_v5": "ECH.ECH47 (AVEPLS)",
+        "aric_field_v7": "ECH.ECH47 (AVEPLS)",
+        "v5_mean": -17.895, "v5_sd": 2.597, "v5_n": 5698, "v5_missing_pct": 6.9,
+        "v7_mean": -17.52, "v7_sd": 2.76, "v7_n": 2918, "v7_missing_pct": 4.8,
+        "v5_range": (-25.79, -3.78), "v7_range": (-24.1, -4.1),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (-28, -3),
+        "emission_eq": "Eq.61: (Ls_min - Ls_max)/Ls_max * 100",
+        "emission_source": "CircAdapt sarcomere mechanics",
+    },
+    "CO_L_min": {
+        "description": "Cardiac output (echo-derived)",
+        "unit": "L/min",
+        "aric_field_v5": "DERIVED from ECH.ECH31 (LVOTVTI) + LVOT diameter + HR",
+        "aric_field_v7": "DERIVED from ECH.ECH31 (LVOTVTI) + LVOT diameter + HR",
+        "v5_mean": 4.6, "v5_sd": 1.1, "v5_n": None, "v5_missing_pct": 0.2,
+        "v7_mean": 4.5, "v7_sd": 1.2, "v7_n": None, "v7_missing_pct": 0.6,
+        "v5_range": (2.0, 9.0), "v7_range": (2.0, 9.0),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (1.5, 10.0),
+        "emission_eq": "Eq.60: SV * HR / 1000",
+        "emission_source": "CircAdapt SV, HR",
+    },
+    # ===== DIASTOLIC FUNCTION (4) =====
+    "E_cm_s": {
+        "description": "Peak E wave (early diastolic mitral inflow) velocity",
+        "unit": "cm/s",
+        "aric_field_v5": "ECH.ECH20 (EWAVE)",
+        "aric_field_v7": "ECH.ECH20 (EWAVE)",
+        "v5_mean": 67.6, "v5_sd": 19.2, "v5_n": 6098, "v5_missing_pct": 0.3,
+        "v7_mean": 75.7, "v7_sd": 21.7, "v7_n": 3041, "v7_missing_pct": 0.8,
+        "v5_range": (23, 189), "v7_range": (25, 215),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (20, 220),
+        "emission_eq": "Eq.62: peak mitral flow velocity in early diastole",
+        "emission_source": "CircAdapt mitral valve flow waveform",
+    },
+    "e_prime_sept_cm_s": {
+        "description": "Septal early diastolic tissue velocity (e' septal)",
+        "unit": "cm/s",
+        "aric_field_v5": "ECH.ECH26 (EASEPT)",
+        "aric_field_v7": "ECH.ECH26 (EASEPT)",
+        "v5_mean": 5.67, "v5_sd": 1.49, "v5_n": 6100, "v5_missing_pct": 0.3,
+        "v7_mean": 5.27, "v7_sd": 1.44, "v7_n": 3018, "v7_missing_pct": 1.5,
+        "v5_range": (1.9, 19.6), "v7_range": (2.0, 14.5),
+        "distribution": "normal",
+        "clinical_weight": 0.9,
+        "physiological_bounds": (1.5, 20),
+        "emission_eq": "Eq.66: k_e' * dLs/dt at early diastole",
+        "emission_source": "CircAdapt sarcomere lengthening rate",
+    },
+    "E_over_e_prime_sept": {
+        "description": "E/e' septal ratio (filling pressure surrogate)",
+        "unit": "ratio",
+        "aric_field_v5": "ECO.ECO7 (EEPRIMESEPT)",
+        "aric_field_v7": "ECH.ECH64 (EEPRIMESEPT)",
+        "v5_mean": 12.57, "v5_sd": 4.73, "v5_n": 6090, "v5_missing_pct": 0.5,
+        "v7_mean": 15.17, "v7_sd": 5.55, "v7_n": 3007, "v7_missing_pct": 1.9,
+        "v5_range": (3.4, 74.2), "v7_range": (3.7, 48.4),
+        "distribution": "lognormal",
+        "clinical_weight": 1.0,
+        "physiological_bounds": (3, 50),
+        "emission_eq": "Eq.68: E / e'",
+        "emission_source": "Derived from E and e' (both from CircAdapt)",
+        "abnormal_threshold": 15,
+    },
+    "E_over_A_ratio": {
+        "description": "E/A ratio (diastolic filling pattern)",
+        "unit": "ratio",
+        "aric_field_v5": "ECH.ECH28 (EARATIO)",
+        "aric_field_v7": "ECH.ECH28 (EARATIO)",
+        "v5_mean": 0.86, "v5_sd": 0.29, "v5_n": 5829, "v5_missing_pct": 4.7,
+        "v7_mean": 0.87, "v7_sd": 0.31, "v7_n": 2829, "v7_missing_pct": 7.7,
+        "v5_range": (0.3, 3.6), "v7_range": (0.3, 4.2),
+        "distribution": "lognormal",
+        "clinical_weight": 0.9,
+        "physiological_bounds": (0.2, 5.0),
+        "emission_eq": "Derived: E_cm_s / A_cm_s",
+        "emission_source": "CircAdapt mitral valve flow waveform (E and A peaks)",
+    },
+    # ===== ATRIAL / RV (2) =====
+    "LAvolume_mL": {
+        "description": "Left atrial volume",
+        "unit": "mL",
+        "aric_field_v5": "ECH.ECH16 (LAV)",
+        "aric_field_v7": "ECH.ECH16 (LAV)",
+        "v5_mean": 49.147, "v5_sd": 19.412, "v5_n": 6052, "v5_missing_pct": 1.1,
+        "v7_mean": 51.988, "v7_sd": 19.029, "v7_n": 2961, "v7_missing_pct": 3.4,
+        "v5_range": (11.86, 353.11), "v7_range": (10.73, 219.88),
+        "distribution": "lognormal",
+        "clinical_weight": 0.7,
+        "physiological_bounds": (10, 250),
+        "emission_eq": "Eq.70: 4/3 * pi * r_LA^3",
+        "emission_source": "CircAdapt LA cavity volume",
+    },
+    "PASP_mmHg": {
+        "description": "Pulmonary artery systolic pressure (estimated)",
+        "unit": "mmHg",
+        "aric_field_v5": "ECH.ECH41 (RVRAG) + estimated RAP",
+        "aric_field_v7": "ECH.ECH41 (RVRAG) + estimated RAP",
+        "v5_mean": 28.3, "v5_sd": 6.1, "v5_n": 3573, "v5_missing_pct": 41.6,
+        "v7_mean": 32.3, "v7_sd": 8.2, "v7_n": 2290, "v7_missing_pct": 25.3,
+        "v5_range": (14.3, 80.8), "v7_range": (13.5, 82.6),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (12, 85),
+        "emission_eq": "Eq.74: 4*v_TR^2 + CVP",
+        "emission_source": "CircAdapt RV pressure + CVP",
+    },
+    # ===== HEMODYNAMICS (3) =====
+    "SBP_mmHg": {
+        "description": "Systolic blood pressure",
+        "unit": "mmHg",
+        "aric_field_v5": "Visit exam form (not echo codebook)",
+        "aric_field_v7": "Visit exam form (not echo codebook)",
+        "v5_mean": 130, "v5_sd": 18, "v5_n": None, "v5_missing_pct": 0.1,
+        "v7_mean": 130, "v7_sd": 20, "v7_n": None, "v7_missing_pct": 0.1,
+        "v5_range": (80, 210), "v7_range": (75, 220),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (70, 230),
+        "emission_eq": "Eq.75: max(P_aorta(t))",
+        "emission_source": "CircAdapt aortic pressure waveform",
+    },
+    "MAP_mmHg": {
+        "description": "Mean arterial pressure (derived from SBP/DBP)",
+        "unit": "mmHg",
+        "aric_field_v5": "Derived: DBP + (SBP-DBP)/3",
+        "aric_field_v7": "Derived: DBP + (SBP-DBP)/3",
+        "v5_mean": 93, "v5_sd": 10, "v5_n": None, "v5_missing_pct": 0.1,
+        "v7_mean": 93, "v7_sd": 11, "v7_n": None, "v7_missing_pct": 0.1,
+        "v5_range": (55, 145), "v7_range": (50, 150),
+        "distribution": "normal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (50, 150),
+        "emission_eq": "Eq.77: integral of P_aorta / T_beat",
+        "emission_source": "CircAdapt aortic pressure waveform",
+    },
+    "SVR_wood": {
+        "description": "Systemic vascular resistance (Wood units)",
+        "unit": "Wood units (mmHg*min/L)",
+        "aric_field_v5": "Derived: (MAP - CVP) / CO",
+        "aric_field_v7": "Derived: (MAP - CVP) / CO",
+        "v5_mean": 20, "v5_sd": 5, "v5_n": None, "v5_missing_pct": 1.0,
+        "v7_mean": 21, "v7_sd": 6, "v7_n": None, "v7_missing_pct": 1.0,
+        "v5_range": (8, 40), "v7_range": (8, 45),
+        "distribution": "normal",
+        "clinical_weight": 0.7,
+        "physiological_bounds": (6, 50),
+        "emission_eq": "Eq.79: (MAP - CVP) / CO",
+        "emission_source": "Derived from CircAdapt hemodynamics",
+    },
+    # ===== RENAL (4) =====
+    "eGFR_mL_min": {
+        "description": "Estimated GFR (CKD-EPI 2021 from creatinine)",
+        "unit": "mL/min/1.73m2",
+        "aric_field_v5": "Lab: CKD-EPI from serum creatinine",
+        "aric_field_v7": "Lab: CKD-EPI from serum creatinine",
+        "v5_mean": 66, "v5_sd": 18, "v5_n": 5170, "v5_missing_pct": 1.0,
+        "v7_mean": 62, "v7_sd": 20, "v7_n": None, "v7_missing_pct": 1.0,
+        "v5_range": (5, 130), "v7_range": (5, 125),
+        "distribution": "normal",
+        "clinical_weight": 1.0,
+        "physiological_bounds": (3, 140),
+        "emission_eq": "Eq.85: CKD-EPI 2021 from modeled creatinine",
+        "emission_source": "Hallow GFR -> creatinine -> CKD-EPI",
+    },
+    "creatinine_mg_dL": {
+        "description": "Serum creatinine",
+        "unit": "mg/dL",
+        "aric_field_v5": "Lab: serum creatinine (IDMS-traceable)",
+        "aric_field_v7": "Lab: serum creatinine",
+        "v5_mean": 1.05, "v5_sd": 0.35, "v5_n": None, "v5_missing_pct": 0.5,
+        "v7_mean": 1.15, "v7_sd": 0.45, "v7_n": None, "v7_missing_pct": 0.5,
+        "v5_range": (0.3, 5.0), "v7_range": (0.3, 6.0),
+        "distribution": "lognormal",
+        "clinical_weight": 0.9,
+        "physiological_bounds": (0.2, 8.0),
+        "emission_eq": "Eq.86: B_Cr / GFR * (1 + 0.02*age/10)",
+        "emission_source": "Hallow GFR + demographics",
+    },
+    "UACR_mg_g": {
+        "description": "Urine albumin-to-creatinine ratio",
+        "unit": "mg/g",
+        "aric_field_v5": "Lab: urine albumin / urine creatinine",
+        "aric_field_v7": "Lab: urine albumin / urine creatinine",
+        "v5_mean": 18, "v5_sd": 35, "v5_n": 5170, "v5_missing_pct": 3.0,
+        "v5_median": 11, "v5_iqr": (6, 22),
+        "v7_mean": 25, "v7_sd": 50, "v7_n": None, "v7_missing_pct": 3.0,
+        "v5_range": (1, 3000), "v7_range": (1, 5000),
+        "distribution": "lognormal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (0.5, 5000),
+        "emission_eq": "Eq.88: Na_alb * (1 + beta_alb * dP_gc) / V_urine",
+        "emission_source": "Hallow glomerular pressure + filtration",
+    },
+    "cystatin_C_mg_L": {
+        "description": "Serum cystatin C",
+        "unit": "mg/L",
+        "aric_field_v5": "Lab: cystatin C (Latex immunoassay, ERM-DA471 traceable)",
+        "aric_field_v7": "Lab: cystatin C",
+        "v5_mean": 1.10, "v5_sd": 0.30, "v5_n": None, "v5_missing_pct": 2.0,
+        "v7_mean": 1.20, "v7_sd": 0.35, "v7_n": None, "v7_missing_pct": 2.0,
+        "v5_range": (0.4, 4.0), "v7_range": (0.4, 5.0),
+        "distribution": "lognormal",
+        "clinical_weight": 0.8,
+        "physiological_bounds": (0.3, 6.0),
+        "emission_eq": "Eq.93: D_cys / GFR * (1 + epsilon * i)",
+        "emission_source": "Hallow GFR + inflammation index",
+    },
+    # ===== BIOMARKERS (2) =====
+    "NTproBNP_pg_mL": {
+        "description": "N-terminal pro-B-type natriuretic peptide",
+        "unit": "pg/mL",
+        "aric_field_v5": "Lab: electrochemiluminescent immunoassay",
+        "aric_field_v7": "Lab: same assay",
+        "v5_mean": 130, "v5_sd": 180, "v5_n": None, "v5_missing_pct": 2.0,
+        "v5_median": 80,
+        "v7_mean": 180, "v7_sd": 250, "v7_n": None, "v7_missing_pct": 2.0,
+        "v5_range": (5, 10000), "v7_range": (5, 15000),
+        "distribution": "lognormal",
+        "clinical_weight": 1.0,
+        "physiological_bounds": (1, 30000),
+        "emission_eq": "Eq.90: B_BNP * exp(b1*LVEDP + b2*CVP + b3*LVmass/BSA)",
+        "emission_source": "CircAdapt hemodynamics + demographics",
+    },
+    "CRP_mg_L": {
+        "description": "High-sensitivity C-reactive protein",
+        "unit": "mg/L",
+        "aric_field_v5": "Lab: immunonephelometric assay (hs-CRP)",
+        "aric_field_v7": "Lab: same assay",
+        "v5_mean": 3.5, "v5_sd": 5.0, "v5_n": None, "v5_missing_pct": 1.0,
+        "v5_median": 2.0,
+        "v7_mean": 4.0, "v7_sd": 6.0, "v7_n": None, "v7_missing_pct": 1.0,
+        "v5_range": (0.1, 50), "v7_range": (0.1, 60),
+        "distribution": "lognormal",
+        "clinical_weight": 0.7,
+        "physiological_bounds": (0.05, 100),
+        "emission_eq": "Eq.92: C_base * exp(delta1*i + delta2*d)",
+        "emission_source": "Inflammation index + diabetes index",
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cystatin C Emission Parameters
+# ═══════════════════════════════════════════════════════════════════════════════
+# Paper Eq. 93: CysC = D_cys / GFR * (1 + epsilon * i)
+# Calibrated so healthy (GFR=100, i=0) -> CysC ~ 0.80 mg/L
+CYSTATIN_C_PARAMS = {
+    "D_cys": 80.0,          # mg*min/(L*mL) — production rate constant
+    "epsilon": 0.30,         # inflammation sensitivity coefficient
+    "healthy_target": 0.80,  # mg/L at GFR=100, i=0
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Measurement Noise (from echo reproducibility literature)
+# ═══════════════════════════════════════════════════════════════════════════════
+# "gaussian_absolute": add N(0, magnitude)
+# "gaussian_relative": multiply by N(1, magnitude)
+MEASUREMENT_NOISE = {
+    "LVIDd_cm":            ("gaussian_relative", 0.04),
+    "LVmass_g":            ("gaussian_relative", 0.08),
+    "LVEF_pct":            ("gaussian_absolute", 3.5),
+    "GLS_pct":             ("gaussian_absolute", 1.5),
+    "CO_L_min":            ("gaussian_relative", 0.10),
+    "E_cm_s":              ("gaussian_relative", 0.08),
+    "e_prime_sept_cm_s":   ("gaussian_relative", 0.10),
+    "E_over_e_prime_sept": ("gaussian_relative", 0.12),
+    "E_over_A_ratio":      ("gaussian_relative", 0.10),
+    "LAvolume_mL":         ("gaussian_relative", 0.10),
+    "PASP_mmHg":           ("gaussian_absolute", 5.0),
+    "SBP_mmHg":            ("gaussian_absolute", 6.0),
+    "MAP_mmHg":            ("gaussian_absolute", 4.0),
+    "SVR_wood":            ("gaussian_relative", 0.10),
+    "eGFR_mL_min":         ("gaussian_relative", 0.05),
+    "creatinine_mg_dL":    ("gaussian_relative", 0.05),
+    "UACR_mg_g":           ("gaussian_relative", 0.20),
+    "cystatin_C_mg_L":     ("gaussian_relative", 0.05),
+    "NTproBNP_pg_mL":      ("gaussian_relative", 0.08),
+    "CRP_mg_L":            ("gaussian_relative", 0.10),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PASP Missingness Model
+# ═══════════════════════════════════════════════════════════════════════════════
+# 41.6% missing at V5 due to absent/insufficient TR jet.
+# Probability of PASP being missing depends on disease severity.
+PASP_MISSING_PARAMS = {
+    "base_missing_prob": 0.42,
+    "pasp_slope": -0.015,        # per mmHg above 25: less likely missing
+    "v7_missing_prob": 0.25,
+}
