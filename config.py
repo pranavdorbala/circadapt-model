@@ -1198,3 +1198,467 @@ NN_DEFAULTS = {
     'val_frac': 0.15,
     'test_frac': 0.15,
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Core 20 Variables for Monthly Trajectory Generation
+# ═══════════════════════════════════════════════════════════════════════════════
+# (Section 3.7 extension — Monthly-resolution synthetic cohort)
+#
+# These 20 variables are the subset of 113 ARIC emission variables selected for
+# monthly trajectory generation. Selection criteria:
+#   (a) Directly and accurately computed from CircAdapt/Hallow internal state
+#   (b) Clinically important for HFpEF/CKD diagnosis and monitoring
+#   (c) Span all organ systems needed for the coupling equation
+#
+# Each entry includes:
+#   - emission_key: the key name returned by extract_all_aric_variables()
+#     (None if the variable must be computed separately from history/schedules)
+#   - weight: importance weight for RL reward computation
+#   - aric_v5_mean/sd: target distribution from ARIC Visit 5 (age ~75)
+#   - abnormal_threshold: clinical cutoff for disease classification
+#   - direction_with_disease: expected trajectory direction
+
+CORE_VARIABLES = {
+    # === LV STRUCTURE (2) ===
+    "LVIDd_cm": {
+        "emission_key": "LVIDd_cm",
+        "emission_eq": 49,
+        "source": "CircAdapt EDV",
+        "weight": 0.5,
+        "unit": "cm",
+        "healthy_mean": 4.7, "healthy_sd": 0.4,
+        "aric_v5_mean": 4.8, "aric_v5_sd": 0.5,
+        "abnormal_threshold": 5.8,
+        "direction_with_disease": "increase",
+    },
+    "LVmass_g": {
+        "emission_key": "LV_mass_g",
+        "emission_eq": 53,
+        "source": "CircAdapt wall volumes",
+        "weight": 0.5,
+        "unit": "g",
+        "healthy_mean": 170, "healthy_sd": 40,
+        "aric_v5_mean": 180, "aric_v5_sd": 50,
+        "abnormal_threshold": 224,
+        "direction_with_disease": "increase",
+    },
+
+    # === LV SYSTOLIC FUNCTION (3) ===
+    "LVEF_pct": {
+        "emission_key": "LVEF_pct",
+        "emission_eq": 58,
+        "source": "CircAdapt EDV, ESV",
+        "weight": 1.0,
+        "unit": "%",
+        "healthy_mean": 62, "healthy_sd": 5,
+        "aric_v5_mean": 61, "aric_v5_sd": 6,
+        "abnormal_threshold": 52,
+        "direction_with_disease": "preserved_then_decrease",
+    },
+    "GLS_pct": {
+        "emission_key": "GLS_pct",
+        "emission_eq": 61,
+        "source": "CircAdapt sarcomere mechanics",
+        "weight": 0.8,
+        "unit": "%",
+        "healthy_mean": -20.0, "healthy_sd": 2.5,
+        "aric_v5_mean": -18.5, "aric_v5_sd": 3.0,
+        "abnormal_threshold": -16.0,
+        "direction_with_disease": "increase",
+    },
+    "CO_L_min": {
+        "emission_key": "CO_Lmin",
+        "emission_eq": 60,
+        "source": "CircAdapt SV, HR",
+        "weight": 0.8,
+        "unit": "L/min",
+        "healthy_mean": 5.0, "healthy_sd": 1.0,
+        "aric_v5_mean": 4.8, "aric_v5_sd": 1.1,
+        "abnormal_threshold": 3.5,
+        "direction_with_disease": "decrease",
+    },
+
+    # === DIASTOLIC FUNCTION (4) ===
+    "E_cm_s": {
+        "emission_key": "E_vel_cms",
+        "emission_eq": 62,
+        "source": "CircAdapt mitral valve flow waveform",
+        "weight": 0.8,
+        "unit": "cm/s",
+        "healthy_mean": 72, "healthy_sd": 16,
+        "aric_v5_mean": 68, "aric_v5_sd": 18,
+        "abnormal_threshold": None,
+        "direction_with_disease": "pseudonormalize",
+    },
+    "e_prime_cm_s": {
+        "emission_key": "e_prime_avg_cms",
+        "emission_eq": 66,
+        "source": "CircAdapt sarcomere lengthening rate",
+        "weight": 0.9,
+        "unit": "cm/s",
+        "healthy_mean": 10.0, "healthy_sd": 2.5,
+        "aric_v5_mean": 7.5, "aric_v5_sd": 2.0,
+        "abnormal_threshold": 7.0,
+        "direction_with_disease": "decrease",
+    },
+    "E_over_e_prime": {
+        "emission_key": "E_e_prime_avg",
+        "emission_eq": 68,
+        "source": "derived from E and e'",
+        "weight": 1.0,
+        "unit": "ratio",
+        "healthy_mean": 8.0, "healthy_sd": 2.5,
+        "aric_v5_mean": 10.0, "aric_v5_sd": 4.0,
+        "abnormal_threshold": 14.0,
+        "direction_with_disease": "increase",
+    },
+    "LVEDP_mmHg": {
+        "emission_key": "LAP_est_mmHg",
+        "emission_eq": 69,
+        "source": "CircAdapt LV pressure (via LAP estimate)",
+        "weight": 1.0,
+        "unit": "mmHg",
+        "healthy_mean": 10, "healthy_sd": 3,
+        "aric_v5_mean": 12, "aric_v5_sd": 4,
+        "abnormal_threshold": 16,
+        "direction_with_disease": "increase",
+    },
+
+    # === ATRIAL / RV (2) ===
+    "LAvolume_mL": {
+        "emission_key": "LAV_max_mL",
+        "emission_eq": 70,
+        "source": "CircAdapt LA cavity",
+        "weight": 0.7,
+        "unit": "mL",
+        "healthy_mean": 52, "healthy_sd": 15,
+        "aric_v5_mean": 58, "aric_v5_sd": 18,
+        "abnormal_threshold": 68,
+        "direction_with_disease": "increase",
+    },
+    "PASP_mmHg": {
+        "emission_key": "PASP_mmHg",
+        "emission_eq": 74,
+        "source": "CircAdapt RV pressure, CVP",
+        "weight": 0.8,
+        "unit": "mmHg",
+        "healthy_mean": 25, "healthy_sd": 5,
+        "aric_v5_mean": 28, "aric_v5_sd": 8,
+        "abnormal_threshold": 35,
+        "direction_with_disease": "increase",
+    },
+
+    # === HEMODYNAMICS (3) ===
+    "SBP_mmHg": {
+        "emission_key": "SBP_mmHg",
+        "emission_eq": 75,
+        "source": "CircAdapt aortic pressure",
+        "weight": 0.8,
+        "unit": "mmHg",
+        "healthy_mean": 120, "healthy_sd": 12,
+        "aric_v5_mean": 130, "aric_v5_sd": 18,
+        "abnormal_threshold": 140,
+        "direction_with_disease": "increase_then_decrease",
+    },
+    "MAP_mmHg": {
+        "emission_key": "MAP_mmHg",
+        "emission_eq": 77,
+        "source": "CircAdapt aortic pressure",
+        "weight": 0.8,
+        "unit": "mmHg",
+        "healthy_mean": 93, "healthy_sd": 8,
+        "aric_v5_mean": 95, "aric_v5_sd": 10,
+        "abnormal_threshold": None,
+        "direction_with_disease": "variable",
+    },
+    "SVR_wood": {
+        "emission_key": None,
+        "emission_eq": 79,
+        "source": "derived from CircAdapt hemodynamics: (MAP - CVP) / CO",
+        "weight": 0.7,
+        "unit": "Wood units",
+        "healthy_mean": 18, "healthy_sd": 4,
+        "aric_v5_mean": 20, "aric_v5_sd": 5,
+        "abnormal_threshold": 25,
+        "direction_with_disease": "increase",
+    },
+
+    # === RENAL (4) ===
+    "eGFR_mL_min": {
+        "emission_key": "eGFR_mL_min_173m2",
+        "emission_eq": 85,
+        "source": "Hallow GFR -> creatinine -> CKD-EPI",
+        "weight": 1.0,
+        "unit": "mL/min/1.73m2",
+        "healthy_mean": 90, "healthy_sd": 15,
+        "aric_v5_mean": 72, "aric_v5_sd": 20,
+        "abnormal_threshold": 60,
+        "direction_with_disease": "decrease",
+    },
+    "creatinine_mg_dL": {
+        "emission_key": "serum_creatinine_mg_dL",
+        "emission_eq": 86,
+        "source": "Hallow GFR, demographics",
+        "weight": 0.9,
+        "unit": "mg/dL",
+        "healthy_mean": 0.9, "healthy_sd": 0.2,
+        "aric_v5_mean": 1.05, "aric_v5_sd": 0.3,
+        "abnormal_threshold": 1.3,
+        "direction_with_disease": "increase",
+    },
+    "UACR_mg_g": {
+        "emission_key": "UACR_mg_g",
+        "emission_eq": 88,
+        "source": "Hallow glomerular pressure",
+        "weight": 0.8,
+        "unit": "mg/g",
+        "healthy_mean": 10, "healthy_sd": 8,
+        "aric_v5_mean": 25, "aric_v5_sd": 40,
+        "abnormal_threshold": 30,
+        "direction_with_disease": "increase",
+        "distribution": "lognormal",
+    },
+    "FENa_pct": {
+        "emission_key": None,
+        "emission_eq": 89,
+        "source": "Hallow tubular sodium handling",
+        "weight": 0.7,
+        "unit": "%",
+        "healthy_mean": 0.8, "healthy_sd": 0.3,
+        "aric_v5_mean": 1.0, "aric_v5_sd": 0.5,
+        "abnormal_threshold": 2.0,
+        "direction_with_disease": "increase",
+    },
+
+    # === BIOMARKERS (2) ===
+    "NTproBNP_pg_mL": {
+        "emission_key": "NTproBNP_pg_mL",
+        "emission_eq": 90,
+        "source": "CircAdapt hemodynamics + demographics",
+        "weight": 1.0,
+        "unit": "pg/mL",
+        "healthy_mean": 50, "healthy_sd": 30,
+        "aric_v5_mean": 120, "aric_v5_sd": 150,
+        "abnormal_threshold": 125,
+        "direction_with_disease": "increase",
+        "distribution": "lognormal",
+    },
+    "CRP_mg_L": {
+        "emission_key": None,
+        "emission_eq": 92,
+        "source": "Inflammation + diabetes indices",
+        "weight": 0.7,
+        "unit": "mg/L",
+        "healthy_mean": 1.5, "healthy_sd": 1.0,
+        "aric_v5_mean": 3.0, "aric_v5_sd": 4.0,
+        "abnormal_threshold": 3.0,
+        "direction_with_disease": "increase",
+        "distribution": "lognormal",
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Measurement Noise Parameters
+# ═══════════════════════════════════════════════════════════════════════════════
+# Noise magnitudes from ARIC echo reproducibility studies and ASE guidelines.
+# Used by synthetic_cohort_monthly.py to add realistic measurement variability.
+
+MEASUREMENT_NOISE = {
+    # Echocardiographic measures: ~5-10% CV for volumes, ~3-5% for linear dims
+    "LVIDd_cm":       ("gaussian_relative", 0.04),
+    "LVmass_g":       ("gaussian_relative", 0.08),
+    "LVEF_pct":       ("gaussian_absolute", 3.0),
+    "GLS_pct":        ("gaussian_absolute", 1.5),
+    "CO_L_min":       ("gaussian_relative", 0.10),
+    "E_cm_s":         ("gaussian_relative", 0.08),
+    "e_prime_cm_s":   ("gaussian_relative", 0.10),
+    "E_over_e_prime": ("gaussian_relative", 0.12),
+    "LVEDP_mmHg":     ("gaussian_absolute", 2.0),
+    "LAvolume_mL":    ("gaussian_relative", 0.10),
+    "PASP_mmHg":      ("gaussian_absolute", 5.0),
+    # Hemodynamics: blood pressure cuff variability
+    "SBP_mmHg":       ("gaussian_absolute", 6.0),
+    "MAP_mmHg":       ("gaussian_absolute", 4.0),
+    "SVR_wood":       ("gaussian_relative", 0.08),
+    # Renal: lab assay variability
+    "eGFR_mL_min":    ("gaussian_relative", 0.05),
+    "creatinine_mg_dL": ("gaussian_relative", 0.05),
+    "UACR_mg_g":      ("gaussian_relative", 0.15),
+    "FENa_pct":       ("gaussian_relative", 0.10),
+    # Biomarkers: assay CV
+    "NTproBNP_pg_mL": ("gaussian_relative", 0.08),
+    "CRP_mg_L":       ("gaussian_relative", 0.10),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RL Coupling Discovery Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration for the attention-based RL agent that learns the inter-organ
+# coupling equation between CircAdapt (heart) and Hallow (kidney) models.
+
+# Feature names for RL observation extraction from simulator state.
+# These define the 32-dim observation vector: 12 cardiac + 10 renal + 5 meta + 5 temporal.
+
+CARDIAC_FEATURE_NAMES = [
+    'MAP', 'SBP', 'DBP', 'CO', 'SV', 'EF', 'EDV', 'ESV',
+    'Pven', 'HR', 'V_blood_total', 'LVEDP',
+]
+
+RENAL_FEATURE_NAMES = [
+    'GFR', 'RBF', 'P_glom', 'Na_excretion', 'V_blood',
+    'C_Na', 'Na_total', 'Kf_scale', 'water_excretion', 'Kf_effective',
+]
+
+META_FEATURE_NAMES = [
+    'effective_Sf', 'effective_Kf', 'effective_k1',
+    'inflammation_scale', 'diabetes_scale',
+]
+
+TEMPORAL_FEATURE_NAMES = [
+    't_normalized', 'delta_MAP', 'delta_GFR', 'delta_EF', 'delta_Vblood',
+]
+
+RL_CONFIG = {
+    # --- Observation space ---
+    'cardiac_dim': len(CARDIAC_FEATURE_NAMES),   # 12
+    'renal_dim': len(RENAL_FEATURE_NAMES),       # 10
+    'meta_dim': len(META_FEATURE_NAMES),          # 5
+    'temporal_dim': len(TEMPORAL_FEATURE_NAMES),  # 5
+    'obs_dim': 32,  # 12 + 10 + 5 + 5
+
+    # --- Action space ---
+    'n_coupling_channels': 5,       # MAP, CO, Pven, V_blood, SVR_ratio
+    'n_inflammatory_residuals': 10, # one per InflammatoryState modifier
+    'action_dim': 15,               # 5 + 10
+
+    # --- Message channel names ---
+    'h2k_channels': ['MAP', 'CO', 'Pven'],
+    'k2h_channels': ['V_blood', 'SVR_ratio'],
+
+    # --- Coupling alpha bounds ---
+    'alpha_min': 0.5,
+    'alpha_max': 1.5,
+
+    # --- Inflammatory residual bounds ---
+    'residual_min': -0.3,
+    'residual_max': 0.3,
+
+    # --- Healthy message baselines (for alpha scaling reference) ---
+    'baselines': {
+        'MAP': 93.0,        # Mean arterial pressure [mmHg]
+        'CO': 5.0,          # Cardiac output [L/min]
+        'Pven': 3.0,        # Central venous pressure [mmHg]
+        'V_blood': 5000.0,  # Blood volume [mL]
+        'SVR_ratio': 1.0,   # Systemic vascular resistance ratio [dimensionless]
+    },
+
+    # --- Episode configuration ---
+    'min_months': 72,       # 6 years
+    'max_months': 120,      # 10 years
+    'default_months': 96,   # 8 years
+    'renal_substeps': 2,    # Inner coupling iterations per monthly RL step
+    'dt_renal_substep': 6.0,  # Hours per renal sub-step (matches original simulation)
+
+    # --- Attention architecture ---
+    'embed_dim': 64,
+    'n_heads': 4,
+    'n_cross_layers': 2,
+    'dropout': 0.1,
+
+    # --- PPO hyperparameters ---
+    'lr': 3e-4,
+    'clip_ratio': 0.2,
+    'entropy_coeff': 0.01,
+    'gamma': 0.99,
+    'gae_lambda': 0.95,
+    'value_loss_coeff': 0.5,
+    'max_grad_norm': 0.5,
+    'n_epochs_per_update': 10,
+    'batch_size': 64,
+    'n_steps_per_rollout': 2048,
+
+    # --- Reward shaping ---
+    'terminal_reward_scale': 10.0,
+    'coupling_reg_coeff': 0.005,    # Penalize |alpha - 1.0|^2
+    'physiology_penalty_coeff': 0.01,
+    'shaped_reward_scale_stage2': 0.1,  # Reduce shaped reward in Stage 2
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Patient Sampling Configuration — Truncated Normal Distributions
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Replaces bimodal (healthy/diseased) uniform splits with unimodal truncated
+# normal distributions centered on clinically realistic values. This suppresses
+# extreme parameter combinations that cause CircAdapt solver divergence while
+# maintaining sufficient pathological diversity for RL training.
+#
+# Design principle: for each parameter, choose center and σ so that:
+#   - The mode sits at a clinically representative value
+#   - ~95% of samples fall within [center - 2σ, center + 2σ]
+#   - Extreme values (near hard bounds) occur with <2.5% probability
+#   - Joint extremes (multiple parameters at bounds simultaneously) are
+#     exponentially unlikely under independent normals, unlike the ~4% rate
+#     under the old joint-uniform scheme
+#
+# To tune: increase σ for more pathological diversity (more solver failures),
+#          decrease σ to concentrate around mild disease (safer but less varied).
+
+SAMPLING_CONFIG = {
+    # --- Baseline disease parameters ---
+    # Each entry: (center, sigma, low_bound, high_bound)
+    #
+    # k1_scale: LV passive stiffness multiplier. 1.0 = healthy, >1.5 = moderate HFpEF.
+    # Center at 1.35 (mild disease) rather than midpoint 1.75 because the ARIC V5
+    # cohort is community-dwelling and predominantly Grade I diastolic dysfunction.
+    # σ=0.35 → P(k1 > 2.0) ≈ 3.2%, P(k1 > 2.3) ≈ 0.3%.
+    'k1_scale':      (1.35, 0.35, 1.0, 2.5),
+
+    # Sf_scale: active contractility. 1.0 = healthy, <0.8 = systolic impairment.
+    # Already was N(0.95, 0.08). Unchanged — already well-behaved.
+    'Sf_scale':      (0.95, 0.08, 0.5, 1.0),
+
+    # Kf_scale: glomerular filtration coefficient (nephron mass). 1.0 = healthy.
+    # Center at 0.80 (mild CKD Stage 2). σ=0.15 → P(Kf < 0.5) ≈ 2.3%.
+    'Kf_scale':      (0.80, 0.15, 0.30, 1.0),
+
+    # diabetes: metabolic burden index [0, 1]. Center at 0.12 (pre-diabetic).
+    # σ=0.15 → P(d > 0.5) ≈ 0.6%. Uses folded normal (|N(0, σ)|) to enforce
+    # non-negativity naturally rather than clipping a centered normal.
+    'diabetes':      (0.12, 0.15, 0.0, 0.8),
+
+    # inflammation: systemic inflammatory index [0, 1].
+    # Uses exponential(λ=0.12) — already right-skewed with P(i > 0.4) ≈ 3.6%.
+    # Not changed to normal because the exponential tail matches clinical CRP data.
+    # Entry format: ('exponential', scale, low, high) to flag special handling.
+    'inflammation':  ('exponential', 0.12, 0.0, 0.8),
+
+    # RAAS_gain, TGF_gain, na_intake: already normal. Listed for completeness.
+    'RAAS_gain':     (1.5, 0.3, 0.5, 3.0),
+    'TGF_gain':      (2.0, 0.4, 1.0, 4.0),
+    'na_intake':     (150.0, 30.0, 80.0, 250.0),
+
+    # --- Annual progression rates ---
+    # Each entry: (center, sigma, low_bound, high_bound)
+    # Center = midpoint of old uniform range, σ = range/4 for 95% coverage.
+    #
+    # k1 annual rate: old U[0.02, 0.10]. Center 0.05 (conservative), σ=0.02.
+    # Before diabetes acceleration factor.
+    'k1_annual_rate':  (0.05, 0.02, 0.01, 0.12),
+
+    # Kf annual rate: old U[0.01, 0.05]. Center 0.025, σ=0.01.
+    # Before diabetes acceleration and nonlinear Kf feedback.
+    'Kf_annual_rate':  (0.025, 0.01, 0.005, 0.06),
+
+    # Sf annual rate: old U[0.002, 0.015]. Center 0.007, σ=0.003.
+    'Sf_annual_rate':  (0.007, 0.003, 0.001, 0.020),
+
+    # Diabetes annual rate (for patients with baseline d > 0.1):
+    # old U[0.02, 0.06]. Center 0.035, σ=0.01.
+    'd_annual_rate':   (0.035, 0.01, 0.01, 0.08),
+
+    # Diabetes annual rate for non-diabetic patients (slow acquisition):
+    'd_annual_rate_low': (0.005, 0.002, 0.001, 0.015),
+}

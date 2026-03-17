@@ -1535,6 +1535,222 @@ def kidney_to_heart(renal: HallowRenalModel, MAP: float, CO: float,
 
 
 # =========================================================================
+# PART 3B -- RL Message Scaling & Inflammatory Residuals
+# =========================================================================
+#
+# These functions implement the learned coupling equation's output:
+# per-message alpha scaling and inflammatory modifier corrections.
+# Used by run_coupled_simulation_rl() when the RL policy is active.
+#
+# Message scaling: scaled = baseline + alpha * (raw - baseline)
+#   alpha = 1.0 → identity (pass through unchanged)
+#   alpha > 1.0 → amplify deviation from healthy baseline
+#   alpha < 1.0 → dampen deviation from healthy baseline
+# =========================================================================
+
+def scale_message_h2k(
+    msg: HeartToKidneyMessage,
+    alpha_vec: np.ndarray,
+    baselines: Dict[str, float],
+) -> HeartToKidneyMessage:
+    """
+    Scale Heart->Kidney message channels around healthy baselines.
+
+    The RL-learned coupling equation produces per-channel alpha weights
+    that modulate how strongly each cardiac output signal is transmitted
+    to the renal model. This replaces the implicit full-strength coupling
+    with a learned, state-dependent coupling intensity.
+
+    Parameters
+    ----------
+    msg : HeartToKidneyMessage
+        Raw message from heart_to_kidney().
+    alpha_vec : np.ndarray
+        3-dim vector [alpha_MAP, alpha_CO, alpha_Pven].
+    baselines : dict
+        Healthy reference values: {'MAP': 93.0, 'CO': 5.0, 'Pven': 3.0}.
+
+    Returns
+    -------
+    HeartToKidneyMessage
+        Scaled message with modulated coupling intensity.
+    """
+    return HeartToKidneyMessage(
+        MAP=baselines['MAP'] + alpha_vec[0] * (msg.MAP - baselines['MAP']),
+        CO=baselines['CO'] + alpha_vec[1] * (msg.CO - baselines['CO']),
+        Pven=baselines['Pven'] + alpha_vec[2] * (msg.Pven - baselines['Pven']),
+        SBP=msg.SBP,
+        DBP=msg.DBP,
+    )
+
+
+def scale_message_k2h(
+    msg: KidneyToHeartMessage,
+    alpha_vec: np.ndarray,
+    baselines: Dict[str, float],
+) -> KidneyToHeartMessage:
+    """
+    Scale Kidney->Heart message channels around healthy baselines.
+
+    Parameters
+    ----------
+    msg : KidneyToHeartMessage
+        Raw message from kidney_to_heart().
+    alpha_vec : np.ndarray
+        2-dim vector [alpha_V_blood, alpha_SVR_ratio].
+    baselines : dict
+        Healthy reference values: {'V_blood': 5000.0, 'SVR_ratio': 1.0}.
+
+    Returns
+    -------
+    KidneyToHeartMessage
+        Scaled message with modulated coupling intensity.
+    """
+    return KidneyToHeartMessage(
+        V_blood=baselines['V_blood'] + alpha_vec[0] * (msg.V_blood - baselines['V_blood']),
+        SVR_ratio=baselines['SVR_ratio'] + alpha_vec[1] * (msg.SVR_ratio - baselines['SVR_ratio']),
+        GFR=msg.GFR,
+    )
+
+
+def apply_inflammatory_residuals(
+    ist: InflammatoryState,
+    residuals: np.ndarray,
+) -> InflammatoryState:
+    """
+    Apply additive residual corrections to the InflammatoryState.
+
+    The RL policy learns corrections to the hand-coded Table 1 modifier
+    factors, discovering where the parametric approximations over- or
+    under-estimate diabetes/inflammation effects that span both organs.
+
+    Parameters
+    ----------
+    ist : InflammatoryState
+        Current inflammatory state (not mutated).
+    residuals : np.ndarray
+        10-dim vector of additive corrections, one per modifier field:
+        [dSf_act_factor, dp0_factor, dstiffness_factor, dpassive_k1_factor,
+         dKf_factor, dR_AA_factor, dR_EA_factor, dRAAS_gain_factor,
+         deta_PT_offset, dMAP_setpoint_offset]
+
+    Returns
+    -------
+    InflammatoryState
+        New state with corrected modifier values, clamped to safe bounds.
+    """
+    import copy
+    ist_corrected = copy.copy(ist)
+    ist_corrected.Sf_act_factor = max(ist.Sf_act_factor + residuals[0], 0.3)
+    ist_corrected.p0_factor = max(ist.p0_factor + residuals[1], 0.5)
+    ist_corrected.stiffness_factor = max(ist.stiffness_factor + residuals[2], 0.5)
+    ist_corrected.passive_k1_factor = max(ist.passive_k1_factor + residuals[3], 0.5)
+    ist_corrected.Kf_factor = float(np.clip(ist.Kf_factor + residuals[4], 0.05, 2.0))
+    ist_corrected.R_AA_factor = max(ist.R_AA_factor + residuals[5], 0.3)
+    ist_corrected.R_EA_factor = max(ist.R_EA_factor + residuals[6], 0.3)
+    ist_corrected.RAAS_gain_factor = max(ist.RAAS_gain_factor + residuals[7], 0.3)
+    ist_corrected.eta_PT_offset = float(np.clip(ist.eta_PT_offset + residuals[8], -0.1, 0.2))
+    ist_corrected.MAP_setpoint_offset = float(np.clip(ist.MAP_setpoint_offset + residuals[9], -10.0, 20.0))
+    return ist_corrected
+
+
+def extract_rl_observation(
+    hemo: Dict,
+    renal: 'HallowRenalModel',
+    ist: InflammatoryState,
+    effective_sf: float,
+    effective_kf: float,
+    effective_k1: float,
+    infl: float,
+    diab: float,
+    t_normalized: float,
+    prev_obs: Optional[Dict] = None,
+) -> Dict[str, float]:
+    """
+    Extract the 32-dim RL observation vector from simulator state.
+
+    Parameters
+    ----------
+    hemo : dict
+        Hemodynamic output from heart.run_to_steady_state().
+    renal : HallowRenalModel
+        Current renal model state.
+    ist : InflammatoryState
+        Current inflammatory state.
+    effective_sf, effective_kf, effective_k1 : float
+        Effective parameter values after inflammatory modification.
+    infl, diab : float
+        Current inflammation and diabetes schedule values.
+    t_normalized : float
+        Normalized time progress (0 to 1).
+    prev_obs : dict or None
+        Previous observation for computing temporal deltas.
+
+    Returns
+    -------
+    dict
+        Observation with 32 named features.
+    """
+    obs = {}
+
+    # Cardiac features (12)
+    obs['MAP'] = hemo['MAP']
+    obs['SBP'] = hemo['SBP']
+    obs['DBP'] = hemo['DBP']
+    obs['CO'] = hemo['CO']
+    obs['SV'] = hemo['SV']
+    obs['EF'] = hemo['EF']
+    obs['EDV'] = hemo['EDV']
+    obs['ESV'] = hemo['ESV']
+    obs['Pven'] = hemo['Pven']
+    obs['HR'] = hemo['HR']
+    obs['V_blood_total'] = hemo.get('V_blood_total', renal.V_blood)
+    # LVEDP approximated from PV loop or LAP estimate
+    obs['LVEDP'] = hemo.get('LVEDP', hemo.get('Pven', 10.0) + 5.0)
+
+    # Renal features (10)
+    obs['GFR'] = renal.GFR
+    obs['RBF'] = renal.RBF
+    obs['P_glom'] = renal.P_glom
+    obs['Na_excretion'] = renal.Na_excretion
+    obs['V_blood'] = renal.V_blood
+    obs['C_Na'] = renal.C_Na
+    obs['Na_total'] = renal.Na_total
+    obs['Kf_scale'] = renal.Kf_scale
+    obs['water_excretion'] = renal.water_excretion
+    obs['Kf_effective'] = renal.Kf * renal.Kf_scale * ist.Kf_factor
+
+    # Meta features (5)
+    obs['effective_Sf'] = effective_sf
+    obs['effective_Kf'] = effective_kf
+    obs['effective_k1'] = effective_k1
+    obs['inflammation_scale'] = infl
+    obs['diabetes_scale'] = diab
+
+    # Temporal features (5)
+    obs['t_normalized'] = t_normalized
+    if prev_obs is not None:
+        obs['delta_MAP'] = obs['MAP'] - prev_obs['MAP']
+        obs['delta_GFR'] = obs['GFR'] - prev_obs['GFR']
+        obs['delta_EF'] = obs['EF'] - prev_obs['EF']
+        obs['delta_Vblood'] = obs['V_blood'] - prev_obs['V_blood']
+    else:
+        obs['delta_MAP'] = 0.0
+        obs['delta_GFR'] = 0.0
+        obs['delta_EF'] = 0.0
+        obs['delta_Vblood'] = 0.0
+
+    return obs
+
+
+def obs_dict_to_vector(obs: Dict[str, float]) -> np.ndarray:
+    """Convert named observation dict to 32-dim numpy vector."""
+    from config import CARDIAC_FEATURE_NAMES, RENAL_FEATURE_NAMES, META_FEATURE_NAMES, TEMPORAL_FEATURE_NAMES
+    all_names = CARDIAC_FEATURE_NAMES + RENAL_FEATURE_NAMES + META_FEATURE_NAMES + TEMPORAL_FEATURE_NAMES
+    return np.array([obs[k] for k in all_names], dtype=np.float32)
+
+
+# =========================================================================
 # PART 4 -- Coupled Simulation Driver  (Section 3.3, Algorithm 1)
 # =========================================================================
 #
@@ -1843,5 +2059,221 @@ def run_coupled_simulation(
     print(f"\n{'='*70}")
     print("  SIMULATION COMPLETE")
     print(f"{'='*70}\n")
+
+    return hist
+
+
+# =========================================================================
+# PART 5 -- RL-Enhanced Coupled Simulation  (Learned Coupling Equation)
+# =========================================================================
+#
+# This variant of the coupled simulation accepts an RL policy function
+# (alpha_fn) that produces per-message coupling weights and inflammatory
+# residual corrections at each step. The learned coupling equation
+# modulates how strongly each organ's outputs affect the other,
+# replacing the implicit full-strength coupling with a state-dependent,
+# per-channel function discovered from data.
+#
+# The original run_coupled_simulation() is preserved unchanged.
+# =========================================================================
+
+def run_coupled_simulation_rl(
+    n_steps: int = 96,
+    dt_renal_hours: float = 180.0,
+    renal_substeps: int = 4,
+    cardiac_schedule: Optional[List[float]] = None,
+    kidney_schedule:  Optional[List[float]] = None,
+    stiffness_schedule: Optional[List[float]] = None,
+    inflammation_schedule: Optional[List[float]] = None,
+    diabetes_schedule: Optional[List[float]] = None,
+    alpha_fn: Optional[callable] = None,
+    baselines: Optional[Dict[str, float]] = None,
+    verbose: bool = False,
+) -> Dict:
+    """
+    RL-enhanced coupled simulation with learned per-message coupling.
+
+    This function mirrors run_coupled_simulation() but adds:
+    1. Per-message alpha scaling via the learned coupling equation
+    2. Inflammatory residual corrections from the RL policy
+    3. Per-step observation recording for RL trajectory collection
+    4. Support for weekly renal sub-steps within each coupling step
+
+    When alpha_fn is None, all alphas default to 1.0 and residuals to 0.0,
+    reproducing the behavior of the original simulation (with the only
+    difference being dt_renal_hours and sub-stepping).
+
+    Parameters
+    ----------
+    n_steps : int
+        Number of coupling steps (e.g., 96 for monthly over 8 years).
+    dt_renal_hours : float
+        Time-step for each renal sub-step [hours]. Default 180h ≈ 1 week.
+    renal_substeps : int
+        Number of renal sub-steps per coupling step. Default 4 (4 weeks/month).
+    cardiac_schedule, kidney_schedule, stiffness_schedule : list or None
+        Per-step parameter schedules (same as run_coupled_simulation).
+    inflammation_schedule, diabetes_schedule : list or None
+        Per-step inflammation/diabetes severity schedules.
+    alpha_fn : callable or None
+        RL policy function: alpha_fn(obs_dict, step) -> (alpha_5, residuals_10).
+        If None, uses identity coupling (alpha=1, residuals=0).
+    baselines : dict or None
+        Healthy message baselines for alpha scaling. Uses RL_CONFIG defaults if None.
+    verbose : bool
+        Whether to print per-step console output.
+
+    Returns
+    -------
+    dict
+        Extended history dictionary with standard fields plus:
+        'observations' : list of per-step observation dicts
+        'actions_alpha' : list of per-step alpha vectors
+        'actions_residual' : list of per-step residual vectors
+    """
+    from config import RL_CONFIG
+
+    # Default baselines from config
+    if baselines is None:
+        baselines = RL_CONFIG['baselines']
+
+    # Default schedules
+    if cardiac_schedule is None:
+        cardiac_schedule = [1.0] * n_steps
+    if kidney_schedule is None:
+        kidney_schedule = [1.0] * n_steps
+    if stiffness_schedule is None:
+        stiffness_schedule = [1.0] * n_steps
+    if inflammation_schedule is None:
+        inflammation_schedule = [0.0] * n_steps
+    if diabetes_schedule is None:
+        diabetes_schedule = [0.0] * n_steps
+
+    # Default alpha_fn: identity coupling
+    if alpha_fn is None:
+        def alpha_fn(obs_dict, step):
+            return np.ones(5), np.zeros(10)
+
+    # Initialize models
+    heart = CircAdaptHeartModel()
+    renal = HallowRenalModel()
+    ist = InflammatoryState()
+
+    # History dictionary (standard fields + RL-specific)
+    hist = {k: [] for k in [
+        'step', 'PV_LV', 'PV_RV',
+        'SBP', 'DBP', 'MAP', 'CO', 'SV', 'EF',
+        'V_blood', 'GFR', 'Na_excr', 'P_glom',
+        'Sf_scale', 'Kf_scale', 'k1_scale',
+        'inflammation_scale', 'diabetes_scale',
+        'effective_Sf', 'effective_Kf', 'effective_k1',
+    ]}
+    hist['observations'] = []
+    hist['actions_alpha'] = []
+    hist['actions_residual'] = []
+
+    prev_obs = None
+
+    for s in range(n_steps):
+        # Read schedule values (plateau at last value if schedule is shorter)
+        sf = cardiac_schedule[min(s, len(cardiac_schedule) - 1)]
+        kf = kidney_schedule[min(s, len(kidney_schedule) - 1)]
+        k1 = stiffness_schedule[min(s, len(stiffness_schedule) - 1)]
+        infl = inflammation_schedule[min(s, len(inflammation_schedule) - 1)]
+        diab = diabetes_schedule[min(s, len(diabetes_schedule) - 1)]
+
+        # Step 0: Update inflammatory state from schedules
+        ist = update_inflammatory_state(ist, infl, diab)
+
+        # Get RL action (alpha + residuals) based on previous observation
+        if prev_obs is not None:
+            alpha_vec, residuals = alpha_fn(prev_obs, s)
+        else:
+            alpha_vec = np.ones(5)
+            residuals = np.zeros(10)
+
+        # Apply inflammatory residual corrections from RL policy
+        ist_corrected = apply_inflammatory_residuals(ist, residuals)
+
+        # Step 1: Apply inflammatory modifiers to heart
+        heart.apply_inflammatory_modifiers(ist_corrected)
+
+        # Step 2: Apply stiffness
+        effective_k1 = k1 * ist_corrected.passive_k1_factor
+        heart.apply_stiffness(effective_k1)
+
+        # Step 3: Apply contractility
+        effective_sf = max(sf * ist_corrected.Sf_act_factor, 0.20)
+        heart.apply_deterioration(effective_sf)
+
+        # Set kidney Kf_scale
+        renal.Kf_scale = kf
+        effective_kf = kf * ist_corrected.Kf_factor
+
+        # Step 4: Run heart to steady state
+        hemo = heart.run_to_steady_state()
+
+        # Step 5: Construct and SCALE Heart->Kidney message
+        h2k_raw = heart_to_kidney(hemo)
+        h2k = scale_message_h2k(h2k_raw, alpha_vec[:3], baselines)
+
+        # Step 6: Run renal sub-steps (e.g., 4 weekly steps per month)
+        for _ in range(renal_substeps):
+            renal = update_renal_model(
+                renal, h2k.MAP, h2k.CO, h2k.Pven,
+                dt_renal_hours,
+                inflammatory_state=ist_corrected,
+            )
+
+        # Step 7: Construct and SCALE Kidney->Heart message
+        k2h_raw = kidney_to_heart(renal, h2k.MAP, h2k.CO, h2k.Pven)
+        k2h = scale_message_k2h(k2h_raw, alpha_vec[3:5], baselines)
+
+        # Step 8: Apply kidney feedback to heart
+        heart.apply_kidney_feedback(
+            V_blood_m3=k2h.V_blood * ML_TO_M3,
+            SVR_ratio=k2h.SVR_ratio,
+        )
+
+        # Extract observation
+        t_normalized = (s + 1) / n_steps
+        obs = extract_rl_observation(
+            hemo, renal, ist_corrected,
+            effective_sf, effective_kf, effective_k1,
+            infl, diab, t_normalized, prev_obs,
+        )
+
+        # Record history
+        hist['step'].append(s + 1)
+        hist['PV_LV'].append((hemo['V_LV'].copy(), hemo['p_LV'].copy()))
+        hist['PV_RV'].append((hemo['V_RV'].copy(), hemo['p_RV'].copy()))
+        hist['SBP'].append(hemo['SBP'])
+        hist['DBP'].append(hemo['DBP'])
+        hist['MAP'].append(hemo['MAP'])
+        hist['CO'].append(hemo['CO'])
+        hist['SV'].append(hemo['SV'])
+        hist['EF'].append(hemo['EF'])
+        hist['V_blood'].append(renal.V_blood)
+        hist['GFR'].append(renal.GFR)
+        hist['Na_excr'].append(renal.Na_excretion)
+        hist['P_glom'].append(renal.P_glom)
+        hist['Sf_scale'].append(sf)
+        hist['Kf_scale'].append(kf)
+        hist['k1_scale'].append(k1)
+        hist['inflammation_scale'].append(infl)
+        hist['diabetes_scale'].append(diab)
+        hist['effective_Sf'].append(effective_sf)
+        hist['effective_Kf'].append(effective_kf)
+        hist['effective_k1'].append(effective_k1)
+        hist['observations'].append(obs)
+        hist['actions_alpha'].append(alpha_vec.copy())
+        hist['actions_residual'].append(residuals.copy())
+
+        prev_obs = obs
+
+        if verbose:
+            print(f"  Step {s+1}/{n_steps}  MAP={hemo['MAP']:.1f}  "
+                  f"GFR={renal.GFR:.1f}  EF={hemo['EF']:.0f}%  "
+                  f"alpha={alpha_vec[:3].tolist()}")
 
     return hist

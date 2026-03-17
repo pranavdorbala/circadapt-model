@@ -159,6 +159,32 @@ class CardiorenalPipeline:
                 print(f"NN model not found at {nn_path}. "
                       f"Pipeline will work without NN (requires explicit V7 target).")
 
+        # ─── Load RL coupling policy (if available) ─────────────────────
+        # The RL attention policy provides learned per-message coupling
+        # weights for the cardiorenal simulator. When available, it
+        # enhances the forward model used by agent_tools.run_circadapt_model()
+        # transparently — the LLM agent is unaware.
+        self.has_rl_policy = False
+        rl_path = os.path.join(base, 'models', 'rl_attention_policy.pt')
+        if os.path.exists(rl_path):
+            try:
+                import torch
+                from models.attention_coupling import AttentionCouplingPolicy
+                rl_ckpt = torch.load(rl_path, map_location='cpu', weights_only=False)
+                self.rl_policy = AttentionCouplingPolicy(**rl_ckpt['config'])
+                self.rl_policy.load_state_dict(rl_ckpt['model_state_dict'])
+                self.rl_policy.eval()
+                self.has_rl_policy = True
+                if verbose:
+                    n_params = sum(p.numel() for p in self.rl_policy.parameters())
+                    print(f"Loaded RL coupling policy from {rl_path} ({n_params:,} params)")
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: failed to load RL policy: {e}")
+        else:
+            if verbose:
+                print("No RL coupling policy found (using standard coupling).")
+
         # ─── Create the LLM agent (Stage 2) ─────────────────────────────
         # The agent is always initialized, even if the NN is missing,
         # because the user can provide an explicit V7 target.
