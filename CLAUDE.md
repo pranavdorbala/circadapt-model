@@ -8,7 +8,7 @@ Paper: "Simulation-Based Digital Twins for Cardiorenal Disease Progression via A
 ## Key Files
 - `cardiorenal_coupling.py` — Core coupled simulation: CircAdapt heart + Hallow kidney + inflammatory mediator layer (Sections 3.1-3.4)
 - `emission_functions.py` — 113 ARIC clinical variable extraction from CircAdapt waveforms + Hallow outputs (Section 3.6)
-- `synthetic_cohort.py` — Synthetic V5/V7 paired cohort generation with correlated disease progression (Section 3.7)
+- `synthetic_cohort.py` — Synthetic cohort generation: paired V5/V7 mode for NN training + monthly trajectory mode for RL (Section 3.7)
 - `train_nn.py` — Residual MLP: X7 = W_skip·X5 + g_phi(X5) with composite loss (Section 3.8, Eq. 14)
 - `agent_loop.py` — Agentic LLM optimizer with tool-calling and Nelder-Mead fallback (Section 3.9)
 - `agent_tools.py` — Four LLM-callable tools wrapping the coupled model (Section 3.9)
@@ -34,8 +34,11 @@ pip install circadapt numpy scipy torch litellm
 # Run coupled simulation
 python -c "from cardiorenal_coupling import run_coupled_simulation; run_coupled_simulation(n_steps=4)"
 
-# Generate synthetic cohort (100 patients, quick test)
-python synthetic_cohort.py --n_patients 100 --n_workers 1
+# Generate paired V5/V7 cohort (100 patients, quick test)
+python synthetic_cohort.py --mode paired --n_patients 100 --n_workers 1
+
+# Generate monthly trajectories (100 patients, 96 months)
+python synthetic_cohort.py --mode monthly --n_patients 100 --n_workers 1
 
 # Train neural network
 python train_nn.py --data cohort_data.npz --epochs 50

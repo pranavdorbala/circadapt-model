@@ -459,7 +459,7 @@ class CardiorenalCouplingEnv(gymnasium.Env):
     ) -> Dict:
         """Generate per-month disease progression schedules for one patient.
 
-        Mirrors generate_progression_schedule() from synthetic_cohort_monthly.py
+        Mirrors generate_progression_schedule() from synthetic_cohort.py
         but for a single patient (not vectorized).
 
         Progression rates are drawn from truncated normal distributions

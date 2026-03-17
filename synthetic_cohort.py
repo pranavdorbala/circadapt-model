@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-Synthetic Cohort Generator: ARIC Visit 5 -> Visit 7 Paired Data
-================================================================
-Paper Reference: Section 3.7 -- Synthetic Cohort Generation
+Synthetic Cohort Generator
+==========================
+Paper Reference: Section 3.7 — Synthetic Cohort Generation
 
-This module generates a synthetic cohort of paired (V5, V7) patient vectors,
-where each vector contains 100+ ARIC-compatible clinical variables computed
-from the full CircAdapt cardiac model coupled with the Hallow et al. (2017)
-renal physiology module. The resulting dataset is used to train the residual
-neural network described in Section 3.8.
+Two generation modes:
 
-High-level pipeline:
-    1. Sample patient demographics (age, sex, BSA, height) from
-       distributions matching the ARIC Visit 5 population (elderly, ~50% female).
-    2. Sample V5 "baseline" disease parameters (contractility, nephron
-       function, inflammation, diabetes, RAAS sensitivity, TGF gain, diet).
-    3. Generate correlated disease-progression deltas (V5 -> V7, ~6 years)
-       using a Cholesky-decomposed correlation matrix that encodes known
-       clinical co-progressions (e.g., worsening kidney <-> worsening heart).
-    4. For each patient, run the coupled CircAdapt + Hallow model at V5 and
-       V7 parameter sets to produce full hemodynamic + renal clinical vectors.
-    5. Collect valid paired vectors into (N, D) arrays saved as .npz.
+1. **Paired (V5→V7)**: Generates paired (Visit 5, Visit 7) clinical vectors
+   using the full CircAdapt + Hallow coupled model. Output: cohort_data.npz
+   with ~100 ARIC variables per visit. Used to train the residual MLP (Section 3.8).
+
+2. **Monthly**: Generates monthly-resolution trajectories (N, T, 20) of 20
+   core clinical variables. Output: cohort_monthly.npz. Used for RL warm-start
+   and pipeline testing.
 
 Usage:
-    python synthetic_cohort.py --n_patients 10000 --n_workers 8
-    python synthetic_cohort.py --n_patients 100 --n_workers 1  # quick test
+    # Paired V5→V7 cohort for NN training
+    python synthetic_cohort.py --mode paired --n_patients 10000 --n_workers 8
+
+    # Monthly trajectories for RL / testing
+    python synthetic_cohort.py --mode monthly --n_patients 5000 --n_months 96
+
+    # Quick test (either mode)
+    python synthetic_cohort.py --mode paired --n_patients 100 --n_workers 1
 """
 
 import os
@@ -32,409 +30,149 @@ import sys
 import argparse
 import time
 import warnings
-import copy
 import numpy as np
-from dataclasses import asdict
 from multiprocessing import Pool
+import multiprocessing as mp
+from scipy import stats
+from scipy.interpolate import interp1d
 from typing import Dict, Tuple, Optional
 
-# ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path so we can import sibling modules
-# (config.py, cardiorenal_coupling.py, emission_functions.py).
-# ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# config.py defines:
-#   TUNABLE_PARAMS  -- parameter names, valid ranges, and defaults
-#   NUMERIC_VAR_NAMES -- the ordered list of ~100 numeric ARIC variable names
-#   NON_NUMERIC_VARS  -- variables excluded from NN training (e.g., diastolic_label)
-#   COHORT_DEFAULTS   -- default cohort generation settings (n_patients, seed, etc.)
-from config import TUNABLE_PARAMS, NUMERIC_VAR_NAMES, NON_NUMERIC_VARS, COHORT_DEFAULTS
+from config import (
+    TUNABLE_PARAMS, NUMERIC_VAR_NAMES, NON_NUMERIC_VARS, COHORT_DEFAULTS,
+    CORE_20_VARIABLES, MEASUREMENT_NOISE, CYSTATIN_C_PARAMS, PASP_MISSING_PARAMS,
+)
 
-# Suppress warnings (mainly NumPy runtime warnings from edge-case hemodynamics
-# and occasional CircAdapt convergence warnings).
 warnings.filterwarnings('ignore')
 
 
-# ===========================================================================
-# Stabilized Renal Model (adapted from dashboard.py with better TGF damping)
-# ===========================================================================
-#
-# Paper Reference: Section 3.7, "Renal Equilibration"
-#
-# The Hallow et al. (2017) renal model uses tubuloglomerular feedback (TGF)
-# and RAAS to regulate glomerular filtration. When coupled with CircAdapt's
-# cardiac output (which produces MAP values around 86-90 mmHg -- somewhat
-# lower than the standalone renal model's 93 mmHg calibration point), the
-# TGF loop can oscillate or diverge if damping is insufficient.
-#
-# This stabilized version uses a heavier damping coefficient of 0.85/0.15
-# (i.e., 85% old value + 15% new value per iteration) versus the original
-# 0.6/0.4. This trades convergence speed for stability, which is critical
-# when running 10,000+ patients in batch -- even rare divergences corrupt
-# the training dataset.
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constants: 20 core clinical variables (monthly trajectories)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+VAR_NAMES = [
+    "LVIDd_cm", "LVmass_g",
+    "LVEF_pct", "GLS_pct", "CO_L_min",
+    "E_cm_s", "e_prime_sept_cm_s", "E_over_e_prime_sept", "E_over_A_ratio",
+    "LAvolume_mL", "PASP_mmHg",
+    "SBP_mmHg", "MAP_mmHg", "SVR_wood",
+    "eGFR_mL_min", "creatinine_mg_dL", "UACR_mg_g", "cystatin_C_mg_L",
+    "NTproBNP_pg_mL", "CRP_mg_L",
+]
+assert len(VAR_NAMES) == 20
+
+VAR_IDX = {name: i for i, name in enumerate(VAR_NAMES)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: Stabilized Renal Model
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hallow et al. (2017) renal model with heavier TGF damping (0.85/0.15)
+# calibrated for CircAdapt's lower MAP (~86 mmHg).
 
 def _update_renal_stable(r, MAP, CO, Pven, dt_hours=6.0):
+    """One timestep of the Hallow renal model with improved TGF damping.
+
+    Computes GFR, RBF, P_glom, Na/water excretion, and volume balance.
+    Heavy damping (0.85 old + 0.15 new) prevents TGF oscillation at
+    CircAdapt's lower MAP range.
     """
-    Hallow renal model update with improved TGF loop damping.
-
-    This function implements one timestep of the Hallow et al. (2017)
-    renal physiology module. It takes the current cardiac hemodynamics
-    (MAP, CO, Pven) as inputs from the heart model and computes:
-      - Glomerular filtration rate (GFR)
-      - Renal blood flow (RBF)
-      - Glomerular capillary pressure (P_glom)
-      - Sodium and water excretion
-      - Blood volume and sodium balance updates
-
-    The key modification vs. the original is the damping factor on line
-    R_AA = 0.85*R_AA + 0.15*R_AA_new (increased from 0.6/0.4 in
-    dashboard.py). This prevents oscillation of the afferent arteriolar
-    resistance during TGF iteration, which can occur at CircAdapt's
-    lower MAP range (~86 mmHg vs the standalone model's ~93 mmHg).
-
-    Parameters
-    ----------
-    r : dict
-        Renal state dictionary (modified IN-PLACE). Contains all renal
-        model parameters and state variables (see _create_renal_state_circadapt).
-    MAP : float
-        Mean arterial pressure from the cardiac model (mmHg).
-    CO : float
-        Cardiac output from the cardiac model (L/min). Not directly used
-        in renal calculations but available for future coupling extensions.
-    Pven : float
-        Central venous pressure (mmHg). Sets renal vein back-pressure.
-    dt_hours : float
-        Time step for volume/sodium balance integration (hours). Default
-        6 hours provides smooth volume dynamics without overshooting.
-    """
-
-    # -----------------------------------------------------------------------
-    # Effective Kf: the product of baseline Kf (calibrated at 8.0 nL/min/mmHg
-    # per nephron to give GFR ~120 mL/min) and Kf_scale (1.0 = healthy,
-    # <1.0 = nephron loss/podocyte injury in CKD).
-    # -----------------------------------------------------------------------
     Kf_eff = r['Kf'] * r['Kf_scale']
-
-    # Renal vein pressure is driven by central venous pressure (CVP).
-    # Floor at 2.0 mmHg to prevent unrealistically low renal perfusion
-    # pressure gradients that would cause division-by-zero in RBF calc.
     r['P_renal_vein'] = max(Pven, 2.0)
 
-    # -----------------------------------------------------------------------
-    # Step 1: RAAS (Renin-Angiotensin-Aldosterone System)
-    # -----------------------------------------------------------------------
-    # RAAS responds to the deviation of MAP from the kidney's setpoint.
-    # When MAP drops below setpoint, RAAS_factor > 1 (vasoconstriction of
-    # efferent arteriole, increased CD sodium reabsorption). When MAP is
-    # above setpoint, RAAS_factor < 1 (vasodilation, natriuresis).
-    #
-    # The gain factor (RAAS_gain * 0.005) is empirically tuned so that a
-    # 10 mmHg MAP drop produces ~7.5% increase in R_EA and eta_CD when
-    # RAAS_gain = 1.5 (default). Clipped to [0.5, 2.0] to prevent extreme
-    # renal hemodynamic changes.
-    # -----------------------------------------------------------------------
+    # RAAS response to MAP deviation from setpoint
     dMAP = MAP - r['MAP_setpoint']
     RAAS_factor = float(np.clip(1.0 - r['RAAS_gain'] * 0.005 * dMAP, 0.5, 2.0))
+    R_EA = r['R_EA0'] * RAAS_factor
+    eta_CD = r['eta_CD0'] * RAAS_factor
 
-    # Apply RAAS to efferent arteriolar resistance and collecting duct
-    # sodium reabsorption efficiency.
-    R_EA = r['R_EA0'] * RAAS_factor         # Efferent arteriole resistance
-    eta_CD = r['eta_CD0'] * RAAS_factor     # Collecting duct Na reabsorption fraction
+    # TGF iteration (20 steps with heavy damping)
+    R_AA = r['R_AA0']
+    GFR = r.get('GFR', 120.0)
+    Na_filt = 0.0
+    P_gc = 60.0
+    RBF = 1100.0
 
-    # -----------------------------------------------------------------------
-    # Step 2: Tubuloglomerular Feedback (TGF) Iteration
-    # -----------------------------------------------------------------------
-    # TGF is a negative feedback loop: macula densa senses Na delivery ->
-    # adjusts afferent arteriolar resistance (R_AA) -> changes GFR -> changes
-    # Na delivery. This is solved iteratively because GFR depends on R_AA
-    # and R_AA depends on GFR (via Na delivery).
-    #
-    # We iterate 20 times (more than the 10 in the original) to ensure
-    # convergence even with heavy damping. Each iteration:
-    #   a) Compute total renal resistance and renal blood flow
-    #   b) Compute glomerular capillary pressure (Kirchhoff's law)
-    #   c) Compute GFR via Starling equation (NFP * Kf)
-    #   d) Compute macula densa Na delivery (Na after proximal tubule + loop)
-    #   e) Compute TGF error signal and update R_AA with heavy damping
-    # -----------------------------------------------------------------------
-    R_AA = r['R_AA0']                     # Initialize afferent arteriolar resistance
-    GFR = r.get('GFR', 120.0)            # Warm-start from previous GFR estimate
-    Na_filt = 0.0                          # Filtered sodium (updated in loop)
-    P_gc = 60.0                            # Glomerular capillary pressure (mmHg)
-    RBF = 1100.0                           # Renal blood flow (mL/min)
-
-    for _ in range(20):  # 20 TGF iterations for convergence with heavy damping
-        # a) Renal blood flow: total pressure drop / total resistance.
-        #    R_preAA = pre-afferent (arcuate + interlobular arteries),
-        #    R_AA = afferent arteriole (TGF-regulated),
-        #    R_EA = efferent arteriole (RAAS-regulated).
-        #    Factor 1000 converts from mL to L (resistance in mmHg*min/L).
+    for _ in range(20):
         R_total = r['R_preAA'] + R_AA + R_EA
         RBF = max((MAP - r['P_renal_vein']) / R_total * 1000.0, 100.0)
-
-        # b) Renal plasma flow: RBF corrected for hematocrit.
-        #    Only plasma is filtered through the glomerulus.
         RPF = RBF * (1.0 - r['Hct'])
-
-        # c) Glomerular capillary pressure: MAP minus pressure drop across
-        #    pre-afferent and afferent arteriolar resistances (Kirchhoff's law).
-        #    Floor at 25 mmHg -- below this, filtration effectively ceases.
-        P_gc = MAP - RBF / 1000.0 * (r['R_preAA'] + R_AA)
-        P_gc = max(P_gc, 25.0)
-
-        # d) Filtration fraction: GFR / RPF. Clamped to [0.01, 0.45] to
-        #    prevent unrealistic values. Normal FF ~ 0.20.
+        P_gc = max(MAP - RBF / 1000.0 * (r['R_preAA'] + R_AA), 25.0)
         FF = float(np.clip(GFR / max(RPF, 1.0), 0.01, 0.45))
-
-        # e) Average oncotic pressure along the glomerular capillary.
-        #    As plasma is filtered, proteins concentrate, raising oncotic
-        #    pressure. The Hallow approximation uses pi_avg = pi_plasma *
-        #    (1 + FF / (2*(1-FF))), which integrates the linear rise
-        #    along the capillary length. pi_plasma ~ 25 mmHg at baseline.
         pi_avg = r['pi_plasma'] * (1.0 + FF / (2.0 * (1.0 - FF)))
-
-        # f) Net filtration pressure (NFP): the driving force for
-        #    ultrafiltration. NFP = P_gc - P_Bowman - pi_oncotic.
-        #    When NFP drops to zero, filtration equilibrium is reached.
         NFP = max(P_gc - r['P_Bow'] - pi_avg, 0.0)
-
-        # g) Single-nephron GFR: Kf_eff * NFP (Starling equation).
         SNGFR = Kf_eff * NFP
-
-        # h) Total GFR: 2 kidneys * N_nephrons * SNGFR.
-        #    Factor 1e-6 converts from nL/min (per-nephron) to mL/min.
-        #    Floor at 5 mL/min (severe renal failure, but not zero).
         GFR = max(2.0 * r['N_nephrons'] * SNGFR * 1e-6, 5.0)
-
-        # i) Recalculate FF with updated GFR for Na filtration.
         FF = float(np.clip(GFR / max(RPF, 1.0), 0.01, 0.45))
-
-        # j) Filtered sodium load (mmol/min): GFR * plasma [Na].
-        #    GFR in mL/min, C_Na in mEq/L -> multiply by 1e-3 for mEq/mL.
         Na_filt = GFR * r['C_Na'] * 1e-3
-
-        # k) Macula densa sodium delivery: Na remaining after proximal
-        #    tubule (reabsorbs ~67%) and loop of Henle (reabsorbs ~25%
-        #    of what PT delivers). This is the TGF sensor signal.
         MD_Na = Na_filt * (1.0 - r['eta_PT']) * (1.0 - r['eta_LoH'])
-
-        # l) Initialize TGF setpoint on first call. The setpoint represents
-        #    the "target" macula densa Na delivery that the TGF loop tries
-        #    to maintain. Setting it to the first computed value means TGF
-        #    error starts at zero and adapts from there.
         if r['TGF_setpoint'] <= 0:
             r['TGF_setpoint'] = MD_Na
-
-        # m) TGF error signal: fractional deviation from setpoint.
-        #    Positive TGF_err (excess Na delivery) -> raise R_AA to
-        #    reduce GFR. Negative (deficit) -> lower R_AA to raise GFR.
         TGF_err = (MD_Na - r['TGF_setpoint']) / max(r['TGF_setpoint'], 1e-6)
-
-        # n) Compute new R_AA based on TGF error. TGF_gain (default 2.0)
-        #    controls how aggressively R_AA responds. Clamp to [0.5x, 3.0x]
-        #    of baseline R_AA0 to prevent runaway vasoconstriction/dilation.
         R_AA_new = r['R_AA0'] * (1.0 + r['TGF_gain'] * TGF_err)
         R_AA_new = float(np.clip(R_AA_new, 0.5 * r['R_AA0'], 3.0 * r['R_AA0']))
-
-        # o) CRITICAL DAMPING: Heavy exponential moving average (0.85/0.15)
-        #    to prevent TGF oscillation. The original dashboard.py used
-        #    0.6/0.4 which works at MAP ~93 but oscillates at CircAdapt's
-        #    MAP ~86. The lower MAP means smaller pressure gradients and
-        #    more sensitive GFR responses, requiring stronger damping.
         R_AA = 0.85 * R_AA + 0.15 * R_AA_new
 
-    # -----------------------------------------------------------------------
-    # Step 3: Tubular Sodium Handling
-    # -----------------------------------------------------------------------
-    # Sequential reabsorption through nephron segments:
-    #   PT (proximal tubule):  ~67% of filtered Na (eta_PT = 0.67)
-    #   LoH (loop of Henle):   ~25% of PT output  (eta_LoH = 0.25)
-    #   DT (distal tubule):    ~5% of LoH output   (eta_DT = 0.05)
-    #   CD (collecting duct):  ~2.4% of DT output  (eta_CD0 = 0.024, RAAS-modified)
-    # -----------------------------------------------------------------------
-    Na_after_PT = Na_filt * (1.0 - r['eta_PT'])     # ~33% passes PT
-    Na_after_LoH = Na_after_PT * (1.0 - r['eta_LoH'])  # ~75% of that passes LoH
-    Na_after_DT = Na_after_LoH * (1.0 - r['eta_DT'])   # ~95% of that passes DT
-    Na_after_CD = Na_after_DT * (1.0 - eta_CD)          # RAAS-modified CD reabsorption
+    # Tubular Na handling
+    Na_after_PT = Na_filt * (1.0 - r['eta_PT'])
+    Na_after_LoH = Na_after_PT * (1.0 - r['eta_LoH'])
+    Na_after_DT = Na_after_LoH * (1.0 - r['eta_DT'])
+    Na_after_CD = Na_after_DT * (1.0 - eta_CD)
 
-    # Pressure-natriuresis: at MAP above setpoint, the kidney excretes
-    # proportionally more sodium (suppressing volume expansion). Below
-    # setpoint, excretion drops (retaining volume). The asymmetric gains
-    # (0.03 above vs 0.015 below) reflect the kidney's stronger natriuretic
-    # response to hypertension vs. its more gradual retention in hypotension.
-    # Floor at 0.3 prevents Na excretion from dropping to near-zero.
     if MAP > r['MAP_setpoint']:
         pn = 1.0 + 0.03 * (MAP - r['MAP_setpoint'])
     else:
         pn = max(0.3, 1.0 + 0.015 * (MAP - r['MAP_setpoint']))
 
-    Na_excr_min = Na_after_CD * pn         # mEq/min of sodium excreted in urine
-    Na_excr_day = Na_excr_min * 1440.0     # mEq/day (1440 min/day)
+    Na_excr_min = Na_after_CD * pn
+    Na_excr_day = Na_excr_min * 1440.0
 
-    # -----------------------------------------------------------------------
-    # Step 4: Water Excretion
-    # -----------------------------------------------------------------------
-    # Fractional water reabsorption (frac_water_reabs = 0.99 means 99% of
-    # filtered water is reabsorbed, producing ~1.2 L/day urine at GFR=120).
-    water_excr_min = GFR * (1.0 - r['frac_water_reabs'])  # mL/min
-    water_excr_day = water_excr_min * 1440.0 / 1000.0     # L/day
+    # Water excretion
+    water_excr_min = GFR * (1.0 - r['frac_water_reabs'])
+    water_excr_day = water_excr_min * 1440.0 / 1000.0
 
-    # -----------------------------------------------------------------------
-    # Step 5: Volume and Sodium Balance (Euler integration)
-    # -----------------------------------------------------------------------
-    # Integrate sodium and water balance over dt_hours. This is the slow
-    # dynamics of the model -- over many timesteps, the body reaches a
-    # steady state where intake = excretion.
-    dt_min = dt_hours * 60.0                 # Convert hours -> minutes
+    # Volume / Na balance (Euler integration)
+    dt_min = dt_hours * 60.0
+    Na_in_min = r['Na_intake'] / 1440.0
+    r['Na_total'] = max(r['Na_total'] + (Na_in_min - Na_excr_min) * dt_min, 800.0)
 
-    # Sodium balance: intake (spread evenly over 24h) minus excretion.
-    Na_in_min = r['Na_intake'] / 1440.0      # mEq/min dietary Na intake
-    r['Na_total'] = max(
-        r['Na_total'] + (Na_in_min - Na_excr_min) * dt_min,
-        800.0   # Floor: minimum body sodium content (mEq)
-    )
+    W_in_min = r['water_intake'] * 1000.0 / 1440.0
+    dV = (W_in_min - water_excr_min) * dt_min
+    r['V_blood'] = float(np.clip(r['V_blood'] + dV * 0.33, 3000.0, 8000.0))
 
-    # Water balance: intake minus excretion, with 0.33 partition to blood.
-    # The 0.33 factor reflects that only ~1/3 of total body water is in
-    # the intravascular compartment (blood volume). The rest distributes
-    # to interstitial and intracellular fluid.
-    W_in_min = r['water_intake'] * 1000.0 / 1440.0  # mL/min water intake
-    dV = (W_in_min - water_excr_min) * dt_min        # mL of water change
-    r['V_blood'] = float(np.clip(
-        r['V_blood'] + dV * 0.33,
-        3000.0,   # Min blood volume: ~3L (severe dehydration limit)
-        8000.0    # Max blood volume: ~8L (severe volume overload limit)
-    ))
-
-    # Compute extracellular fluid volume (ECF = blood / 0.33) and update
-    # serum sodium concentration. Clamped to [125, 155] mEq/L to stay
-    # within survivable hypo/hypernatremia bounds.
     V_ECF = r['V_blood'] / 0.33
     r['C_Na'] = float(np.clip(r['Na_total'] / (V_ECF * 1e-3), 125.0, 155.0))
 
-    # -----------------------------------------------------------------------
-    # Step 6: Store Computed Outputs
-    # -----------------------------------------------------------------------
-    # These are read by the emission functions to produce ARIC variables.
-    r['GFR'] = round(float(GFR), 1)                    # mL/min
-    r['RBF'] = round(float(RBF), 1)                    # mL/min
-    r['P_glom'] = round(float(P_gc), 1)                # mmHg
-    r['Na_excretion'] = round(float(Na_excr_day), 1)   # mEq/day
-    r['water_excretion'] = round(float(water_excr_day), 2)  # L/day
+    r['GFR'] = round(float(GFR), 1)
+    r['RBF'] = round(float(RBF), 1)
+    r['P_glom'] = round(float(P_gc), 1)
+    r['Na_excretion'] = round(float(Na_excr_day), 1)
+    r['water_excretion'] = round(float(water_excr_day), 2)
 
 
 def _create_renal_state_circadapt(na_intake=150.0, raas_gain=1.5, tgf_gain=2.0, kf_scale=1.0):
-    """
-    Create a renal state dictionary calibrated for CircAdapt's MAP range (~86 mmHg).
-
-    Paper Reference: Section 3.7, "Renal Model Calibration"
-
-    The resistance values (R_preAA=9.5, R_AA0=20.5, R_EA0=43.0) are
-    specifically tuned for CircAdapt's lower MAP output (~86 mmHg), which
-    differs from the standalone dashboard model (R_preAA=12, R_AA0=26).
-    These lower resistances maintain physiological GFR (~120 mL/min) despite
-    the lower driving pressure.
-
-    Key calibration targets:
-      - GFR = ~120 mL/min with Kf_scale=1.0 and MAP=86
-      - RBF = ~1100 mL/min
-      - P_glom = ~55-62 mmHg
-      - Na excretion = Na intake at steady state
-
-    Parameters
-    ----------
-    na_intake : float
-        Dietary sodium intake in mEq/day. Default 150 = typical Western diet.
-    raas_gain : float
-        RAAS feedback sensitivity. Default 1.5 = moderate responsiveness.
-    tgf_gain : float
-        Tubuloglomerular feedback gain. Default 2.0 = normal TGF.
-    kf_scale : float
-        Glomerular ultrafiltration coefficient scale. 1.0 = healthy,
-        <1.0 = CKD (nephron loss, podocyte damage, mesangial expansion).
-
-    Returns
-    -------
-    dict
-        Renal state dictionary with all parameters and initial state variables.
-    """
+    """Create renal state dict calibrated for CircAdapt's MAP (~86 mmHg)."""
     return {
-        # ----- Structural / fixed parameters -----
-        'N_nephrons': 1e6,        # Number of nephrons per kidney (normal ~1 million)
-        'Kf': 8.0,               # Ultrafiltration coefficient (nL/min/mmHg per nephron),
-                                  #   calibrated so 2*1e6*8.0*NFP*1e-6 ~ 120 mL/min
-
-        # ----- Renal vascular resistances (mmHg*min/L) -----
-        # These are LOWER than the standalone model (R_preAA=12, R_AA0=26)
-        # to compensate for CircAdapt's lower MAP (~86 vs ~93 mmHg).
-        'R_preAA': 9.5,          # Pre-afferent arteriolar resistance (arcuate arteries)
-        'R_AA0': 20.5,           # Baseline afferent arteriolar resistance (TGF-regulated)
-        'R_EA0': 43.0,           # Baseline efferent arteriolar resistance (RAAS-regulated)
-
-        # ----- Pressures (mmHg) -----
-        'P_Bow': 18.0,           # Bowman's capsule pressure
-        'P_renal_vein': 4.0,     # Renal venous pressure (will be updated from CVP)
-
-        # ----- Oncotic / blood composition -----
-        'pi_plasma': 25.0,       # Baseline plasma oncotic pressure (mmHg)
-        'Hct': 0.45,             # Hematocrit (fraction)
-
-        # ----- Tubular reabsorption fractions -----
-        # These determine what fraction of filtered Na is reabsorbed at each
-        # nephron segment. Sequential: PT -> LoH -> DT -> CD.
-        'eta_PT': 0.67,          # Proximal tubule: reabsorbs 67% of filtered Na
-        'eta_LoH': 0.25,         # Loop of Henle: reabsorbs 25% of PT output
-        'eta_DT': 0.05,          # Distal tubule: reabsorbs 5% of LoH output
-        'eta_CD0': 0.024,        # Collecting duct baseline: 2.4% of DT output (RAAS-modified)
-        'frac_water_reabs': 0.99,  # 99% of filtered water reabsorbed
-
-        # ----- Intake -----
-        'Na_intake': na_intake,  # Dietary Na (mEq/day)
-        'water_intake': 2.0,     # Dietary water intake (L/day)
-
-        # ----- Feedback gains -----
-        'TGF_gain': tgf_gain,    # Tubuloglomerular feedback gain
-        'TGF_setpoint': 0.0,     # Initialized to 0; set on first TGF iteration
-        'RAAS_gain': raas_gain,  # RAAS sensitivity to MAP deviation
-        'MAP_setpoint': 86.0,    # Kidney's MAP setpoint (calibrated for CircAdapt)
-
-        # ----- State variables (initial conditions) -----
-        'V_blood': 5000.0,       # Blood volume (mL), normal ~5L
-        'Na_total': 2100.0,      # Total body sodium (mEq), normal ~2100
-        'C_Na': 140.0,           # Serum sodium concentration (mEq/L), normal ~140
-
-        # ----- Output variables (computed by _update_renal_stable) -----
-        'GFR': 120.0,            # Glomerular filtration rate (mL/min)
-        'RBF': 1100.0,           # Renal blood flow (mL/min)
-        'P_glom': 60.0,          # Glomerular capillary pressure (mmHg)
-        'Na_excretion': 150.0,   # Sodium excretion (mEq/day)
-        'water_excretion': 1.5,  # Water excretion (L/day)
-
-        # ----- Disease parameter -----
-        'Kf_scale': kf_scale,    # 1.0 = healthy, <1 = CKD nephron loss
+        'N_nephrons': 1e6, 'Kf': 8.0,
+        'R_preAA': 9.5, 'R_AA0': 20.5, 'R_EA0': 43.0,
+        'P_Bow': 18.0, 'P_renal_vein': 4.0,
+        'pi_plasma': 25.0, 'Hct': 0.45,
+        'eta_PT': 0.67, 'eta_LoH': 0.25, 'eta_DT': 0.05,
+        'eta_CD0': 0.024, 'frac_water_reabs': 0.99,
+        'Na_intake': na_intake, 'water_intake': 2.0,
+        'TGF_gain': tgf_gain, 'TGF_setpoint': 0.0,
+        'RAAS_gain': raas_gain, 'MAP_setpoint': 86.0,
+        'V_blood': 5000.0, 'Na_total': 2100.0, 'C_Na': 140.0,
+        'GFR': 120.0, 'RBF': 1100.0, 'P_glom': 60.0,
+        'Na_excretion': 150.0, 'water_excretion': 1.5,
+        'Kf_scale': kf_scale,
     }
 
 
-# ===========================================================================
-# Core Model Evaluation
-# ===========================================================================
-#
-# Paper Reference: Section 3.7, "Coupled Model Evaluation"
-#
-# For each patient at a given parameter set, we:
-#   1. Construct a CircAdapt heart model (provides full cardiac waveforms:
-#      pressures, volumes, flows for all four chambers + great vessels).
-#   2. Construct the Hallow renal model calibrated for CircAdapt's MAP.
-#   3. Apply inflammatory and metabolic modifiers (from InflammatoryState)
-#      which bidirectionally affect both cardiac and renal parameters.
-#   4. Equilibrate the renal model at the cardiac hemodynamics to find
-#      the coupled steady-state GFR, RBF, P_glom.
-#   5. Extract 100+ ARIC-compatible clinical variables from the combined
-#      cardiac waveforms + renal state using emission_functions.py.
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: Core Model Evaluation (used by agent_tools, pipeline, agent_loop)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_patient_state(
     params: Dict,
@@ -442,50 +180,23 @@ def evaluate_patient_state(
     n_coupling_steps: int = 2,
     dt_renal_hours: float = 6.0,
 ) -> Optional[Dict]:
-    """
-    Run CircAdapt heart + stabilized Hallow renal model coupled together,
-    and extract ARIC-compatible clinical variables.
+    """Run CircAdapt heart + Hallow renal coupled model, extract ~113 ARIC variables.
 
-    This is the core "forward model" that maps disease parameters (latent
-    variables) to observable clinical measurements (emission variables).
-    It implements the coupled heart-kidney simulation described in
-    Section 3.7 of the paper.
+    This is the core forward model: disease parameters → clinical measurements.
 
     Parameters
     ----------
     params : dict
-        Disease parameters with keys matching TUNABLE_PARAMS:
-          - Sf_act_scale : float -- active fiber stress (contractility), 1.0 = normal
-          - Kf_scale : float -- glomerular filtration capacity, 1.0 = normal
-          - inflammation_scale : float -- systemic inflammation, 0.0 = none
-          - diabetes_scale : float -- metabolic/diabetic burden, 0.0 = none
-          - k1_scale : float -- passive myocardial stiffness, 1.0 = normal
-          - RAAS_gain : float -- RAAS feedback sensitivity
-          - TGF_gain : float -- tubuloglomerular feedback gain
-          - na_intake : float -- dietary sodium (mEq/day)
+        Disease parameters (Sf_act_scale, Kf_scale, inflammation_scale,
+        diabetes_scale, k1_scale, RAAS_gain, TGF_gain, na_intake).
     demographics : dict
-        Patient demographics:
-          - age : float -- age in years
-          - sex : str -- 'M' or 'F'
-          - BSA : float -- body surface area (m^2)
-          - height_m : float -- height in meters
-    n_coupling_steps : int
-        Not used (kept for API compatibility with earlier versions that
-        iterated heart-kidney coupling). Renal model is equilibrated
-        in 5 internal passes instead.
-    dt_renal_hours : float
-        Renal model time step (hours) for volume/sodium integration.
+        Patient demographics (age, sex, BSA, height_m).
 
     Returns
     -------
     dict or None
-        Dictionary of ~113 ARIC variable names -> float values.
-        Returns None if CircAdapt fails to converge or any other error occurs
-        (the patient is then excluded from the cohort).
+        ~113 ARIC variable names → float values, or None on failure.
     """
-    # Lazy imports: these modules are heavy (CircAdapt loads .npy reference
-    # data, emission_functions has many numpy operations). Importing inside
-    # the function allows multiprocessing workers to import independently.
     from cardiorenal_coupling import (
         CircAdaptHeartModel, InflammatoryState,
         update_inflammatory_state, ML_TO_M3,
@@ -493,27 +204,9 @@ def evaluate_patient_state(
     from emission_functions import extract_all_aric_variables
 
     try:
-        # ===================================================================
-        # Step 1: Create CircAdapt Heart Model
-        # ===================================================================
-        # CircAdapt is a lumped-parameter model of the cardiovascular system.
-        # It simulates all four cardiac chambers, valves, great vessels, and
-        # systemic/pulmonary circulations. The model solves for pressure-
-        # volume loops, providing full waveform data (LV pressure, LV volume,
-        # aortic pressure, etc.) needed to compute echocardiographic variables.
         heart = CircAdaptHeartModel()
-
-        # InflammatoryState holds multiplicative/additive modifiers that
-        # represent the effects of systemic inflammation and diabetes on
-        # both cardiac and renal parameters. Initialized to no-disease state.
         ist = InflammatoryState()
 
-        # ===================================================================
-        # Step 2: Create Renal Model
-        # ===================================================================
-        # Initialize Hallow renal model with patient-specific parameters.
-        # The renal model runs at CircAdapt's MAP (~86 mmHg) and needs
-        # resistances calibrated for that lower pressure regime.
         renal = _create_renal_state_circadapt(
             na_intake=params.get('na_intake', 150.0),
             raas_gain=params.get('RAAS_gain', 1.5),
@@ -521,665 +214,200 @@ def evaluate_patient_state(
             kf_scale=params.get('Kf_scale', 1.0),
         )
 
-        # ===================================================================
-        # Step 3: Update Inflammatory / Metabolic State
-        # ===================================================================
-        # The InflammatoryState computes cascading modifiers:
-        #   - inflammation -> Sf_act_factor (reduces contractility),
-        #     p0_factor (raises SVR), stiffness_factor (arterial stiffening),
-        #     Kf_factor (reduces filtration), R_AA_factor, RAAS_gain_factor,
-        #     eta_PT_offset, MAP_setpoint_offset
-        #   - diabetes -> passive_k1_factor (diastolic stiffness, key for HFpEF),
-        #     stiffness_factor (AGE cross-linking), Kf_factor (biphasic:
-        #     early hyperfiltration then decline), R_EA_factor, eta_PT_offset
-        #     (SGLT2 effect), MAP_setpoint_offset
         ist = update_inflammatory_state(
             ist,
             inflammation_scale=params.get('inflammation_scale', 0.0),
             diabetes_scale=params.get('diabetes_scale', 0.0),
         )
 
-        # ===================================================================
-        # Step 4: Apply Inflammatory Modifiers to Heart Model
-        # ===================================================================
-        # This adjusts CircAdapt parameters for SVR, arterial compliance,
-        # and other systemic effects driven by inflammation/diabetes.
         heart.apply_inflammatory_modifiers(ist)
 
-        # ===================================================================
-        # Step 5: Apply Diastolic Stiffness
-        # ===================================================================
-        # Effective k1 = user-specified k1_scale * inflammatory k1 factor.
-        # k1_scale > 1 represents primary HFpEF (e.g., from hypertensive
-        # remodeling, amyloid, etc.). The inflammatory k1 factor adds
-        # diabetes-driven stiffening (AGE cross-linking of titin/collagen).
-        # The product captures both primary and secondary diastolic dysfunction.
         effective_k1 = params.get('k1_scale', 1.0) * ist.passive_k1_factor
         heart.apply_stiffness(effective_k1)
 
-        # ===================================================================
-        # Step 6: Apply Contractility Deterioration
-        # ===================================================================
-        # Effective Sf_act = user-specified scale * inflammatory Sf_act factor.
-        # Floor at 0.20 to prevent the solver from encountering zero
-        # contractility (which causes CircAdapt to fail to converge).
         effective_sf = max(
             params.get('Sf_act_scale', 1.0) * ist.Sf_act_factor, 0.20
         )
         heart.apply_deterioration(effective_sf)
 
-        # ===================================================================
-        # Step 7: Run CircAdapt to Hemodynamic Steady State
-        # ===================================================================
-        # CircAdapt iterates multiple cardiac cycles until pressures, volumes,
-        # and flows converge (typically 20-50 beats). Returns a dict with:
-        #   MAP, CO, Pven (central venous pressure), SBP, DBP, etc.
         hemo = heart.run_to_steady_state()
 
-        # ===================================================================
-        # Step 8: Equilibrate Renal Model at Cardiac Hemodynamics
-        # ===================================================================
-        # Run 5 passes of the renal model to find hemodynamic equilibrium
-        # (GFR, P_glom, RBF) at the cardiac model's MAP/CO/CVP.
-        #
-        # IMPORTANT: We hold V_blood, Na_total, and C_Na fixed during
-        # equilibration. This is because we are finding the HEMODYNAMIC
-        # steady state (what GFR would be at these pressures), not the
-        # VOLUME steady state (which would take simulated weeks). The
-        # volume balance is imposed analytically: at true steady state,
-        # Na_excretion = Na_intake and blood volume is stable.
-        #
-        # The TGF_setpoint is reset to 0 each pass so it re-calibrates
-        # to the current hemodynamic conditions rather than carrying over
-        # a stale setpoint from a previous iteration.
+        # Equilibrate renal model (5 passes, hold volume/Na fixed)
         for _ in range(5):
-            renal['C_Na'] = 140.0           # Hold serum Na at normal
-            renal['TGF_setpoint'] = 0.0     # Re-calibrate TGF each pass
+            renal['C_Na'] = 140.0
+            renal['TGF_setpoint'] = 0.0
             _update_renal_stable(renal, hemo['MAP'], hemo['CO'], hemo['Pven'], dt_renal_hours)
-            renal['V_blood'] = 5000.0       # Reset blood volume (no drift)
-            renal['Na_total'] = 2100.0      # Reset total body Na
-            renal['C_Na'] = 140.0           # Reset serum Na
+            renal['V_blood'] = 5000.0
+            renal['Na_total'] = 2100.0
+            renal['C_Na'] = 140.0
 
-        # ===================================================================
-        # Step 9: Build Renal State Dict for Emission Functions
-        # ===================================================================
-        # At true steady state, Na excretion equals Na intake (by definition
-        # of steady state). We enforce this rather than using the model's
-        # computed excretion, which may not have fully equilibrated.
         renal_state = {
             'GFR': renal['GFR'],
-            'V_blood': 5000.0,              # Normal blood volume at steady state
-            'C_Na': 140.0,                  # Normal serum Na at steady state
-            'Na_excretion': params.get('na_intake', 150.0),  # Steady state: excr = intake
+            'V_blood': 5000.0,
+            'C_Na': 140.0,
+            'Na_excretion': params.get('na_intake', 150.0),
             'P_glom': renal['P_glom'],
             'Kf_scale': renal['Kf_scale'],
             'RBF': renal['RBF'],
         }
 
-        # ===================================================================
-        # Step 10: Extract ARIC Variables
-        # ===================================================================
-        # emission_functions.extract_all_aric_variables() takes the raw
-        # CircAdapt model object (with full waveform data) and the renal
-        # state dict, plus demographics, and computes ~113 clinical variables
-        # matching ARIC echocardiographic, hemodynamic, and lab measurements.
-        # These include LV volumes/EF, Doppler velocities, tissue Doppler,
-        # filling pressures, strain, RV function, vascular coupling,
-        # biomarkers (NT-proBNP, troponin, creatinine), and renal function.
-        age = demographics.get('age', 75.0)
-        sex = demographics.get('sex', 'M')
-        BSA = demographics.get('BSA', 1.9)
-        height_m = demographics.get('height_m', 1.70)
-
         aric_vars = extract_all_aric_variables(
             heart.model, renal_state,
-            BSA=BSA, height_m=height_m, age=age, sex=sex,
+            BSA=demographics.get('BSA', 1.9),
+            height_m=demographics.get('height_m', 1.70),
+            age=demographics.get('age', 75.0),
+            sex=demographics.get('sex', 'M'),
         )
 
         return aric_vars
 
-    except Exception as e:
-        # Any failure (CircAdapt divergence, numerical issues, etc.) causes
-        # this patient to be skipped. This is expected for ~1-5% of patients,
-        # particularly those with extreme parameter combinations (very low
-        # Sf_act + very low Kf + high inflammation). The caller handles
-        # None returns by excluding the patient from the cohort.
+    except Exception:
         return None
 
 
-# ===========================================================================
-# Patient Sampling
-# ===========================================================================
-#
-# Paper Reference: Section 3.7, "Patient Sampling Strategy"
-#
-# The synthetic cohort must cover the clinically relevant parameter space
-# while maintaining realistic correlations between disease axes. The
-# strategy uses:
-#   1. Marginal distributions for each V5 baseline parameter chosen to
-#      match the ARIC Visit 5 population demographics and disease prevalence.
-#   2. A Cholesky-decomposed correlation matrix for disease PROGRESSION
-#      deltas (V5 -> V7) that encodes known clinical co-progressions.
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: V5→V7 Paired Cohort Generation
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ---------------------------------------------------------------------------
-# Correlation Matrix for Disease Progression Deltas
-# ---------------------------------------------------------------------------
-#
-# Paper Reference: Section 3.7, "Correlated Disease Progression"
-#
-# This 6x6 matrix encodes the correlations between CHANGES in disease
-# parameters over the ~6-year V5-to-V7 interval. The signs and magnitudes
-# reflect established clinical knowledge about cardiorenal syndrome:
-#
-# Row/Col order: delta_Sf_act, delta_Kf, delta_inflammation,
-#                delta_diabetes, delta_RAAS, delta_na_intake
-#
-#   [0,1] = 0.4  (Sf_act <-> Kf):
-#       Heart failure and kidney disease co-progress. Patients whose
-#       contractility worsens also tend to lose nephron function, and
-#       vice versa. This is the hallmark of cardiorenal syndrome (CRS)
-#       Types 1-4. Correlation is positive because BOTH deltas are negative
-#       when disease worsens (decline in Sf_act AND decline in Kf).
-#
-#   [0,2] = -0.2 (Sf_act <-> inflammation):
-#       Worsening contractility (negative delta_Sf_act) correlates with
-#       increasing inflammation (positive delta_inflammation). The negative
-#       sign reflects the opposite conventions: Sf_act decreases while
-#       inflammation increases during disease progression.
-#
-#   [1,2] = -0.3 (Kf <-> inflammation):
-#       Declining nephron function correlates with rising inflammation.
-#       CKD drives a chronic inflammatory state (uremic toxins, reduced
-#       clearance of inflammatory mediators), and inflammation accelerates
-#       glomerulosclerosis. Stronger than [0,2] because the kidney-
-#       inflammation link is more direct than heart-inflammation.
-#
-#   [2,3] = 0.3  (inflammation <-> diabetes):
-#       Inflammation and diabetes co-progress. Metabolic syndrome involves
-#       both insulin resistance and chronic low-grade inflammation (elevated
-#       CRP, IL-6, TNF-alpha). Diabetes worsening drives more inflammation,
-#       and inflammation worsens insulin resistance.
-#
-#   [1,3] = -0.2 (Kf <-> diabetes):
-#       Diabetic nephropathy: worsening diabetes damages glomeruli,
-#       reducing Kf. This is the leading cause of CKD worldwide.
-#
-#   [3,4] = 0.1  (diabetes <-> RAAS):
-#       Mild correlation: worsening diabetes is associated with RAAS
-#       activation (hyperglycemia stimulates intrarenal RAAS). Weak
-#       because many patients are on ACE-inhibitors/ARBs.
-#
-#   [1,4] = -0.1 (Kf <-> RAAS):
-#       CKD progression mildly correlates with RAAS activation. Nephron
-#       loss triggers compensatory RAAS activation to maintain GFR.
-#
-#   [4,5] = 0.1  (RAAS <-> na_intake):
-#       Very weak: RAAS changes and dietary Na changes are nearly
-#       independent, with only a slight correlation from dietary counseling
-#       that often accompanies RAAS-targeted therapy.
-#
-#   All other off-diagonal elements = 0.0: assumed independent.
-#   Diagonal = 1.0: unit variance for standard normal draws.
-# ---------------------------------------------------------------------------
+# Correlation matrix for disease progression deltas (V5→V7, ~6 years).
+# Order: delta_Sf_act, delta_Kf, delta_inflammation, delta_diabetes,
+#         delta_RAAS, delta_na_intake
 _DELTA_CORR = np.array([
-    [ 1.0, 0.4, -0.2, -0.1,  0.0,  0.0],  # Sf_act (contractility)
-    [ 0.4, 1.0, -0.3, -0.2, -0.1,  0.0],  # Kf (nephron function)
-    [-0.2,-0.3,  1.0,  0.3,  0.2,  0.0],  # inflammation
-    [-0.1,-0.2,  0.3,  1.0,  0.1,  0.0],  # diabetes
-    [ 0.0,-0.1,  0.2,  0.1,  1.0,  0.1],  # RAAS gain
-    [ 0.0, 0.0,  0.0,  0.0,  0.1,  1.0],  # Na intake
+    [ 1.0, 0.4, -0.2, -0.1,  0.0,  0.0],   # Sf_act
+    [ 0.4, 1.0, -0.3, -0.2, -0.1,  0.0],   # Kf
+    [-0.2,-0.3,  1.0,  0.3,  0.2,  0.0],   # inflammation
+    [-0.1,-0.2,  0.3,  1.0,  0.1,  0.0],   # diabetes
+    [ 0.0,-0.1,  0.2,  0.1,  1.0,  0.1],   # RAAS
+    [ 0.0, 0.0,  0.0,  0.0,  0.1,  1.0],   # Na intake
 ])
-
-# Cholesky decomposition: L such that L @ L^T = _DELTA_CORR.
-# Multiplying L by a vector of independent standard normals produces
-# a vector with the desired correlation structure. This is the standard
-# technique for sampling from a multivariate normal with specified
-# correlation matrix.
 _DELTA_CHOL = np.linalg.cholesky(_DELTA_CORR)
 
 
 def sample_correlated_deltas(rng: np.random.Generator) -> Dict:
-    """
-    Sample correlated disease progression deltas for the V5 -> V7 interval (~6 years).
-
-    Paper Reference: Section 3.7, "Correlated Disease Progression"
-
-    Uses Cholesky decomposition of the correlation matrix to generate
-    correlated standard normal draws, then maps them to clinically
-    meaningful delta magnitudes.
-
-    The mapping from correlated normals to deltas uses:
-      - abs() for deltas that should be unidirectional (disease only worsens):
-        contractility declines, kidney function declines, inflammation rises,
-        diabetes progresses
-      - Signed values for bidirectional changes: RAAS can increase or decrease
-        (e.g., if patient starts/stops ACEi), Na intake can change either way
-      - Scale factors calibrated to produce realistic 6-year progression rates
-
-    Parameters
-    ----------
-    rng : np.random.Generator
-        Seeded random number generator for reproducibility.
-
-    Returns
-    -------
-    dict
-        Keys: delta_Sf_act, delta_Kf, delta_inflammation, delta_diabetes,
-              delta_RAAS, delta_na
-        Values: float deltas to add to V5 parameters to get V7 parameters.
-    """
-    # Draw 6 independent standard normal samples
+    """Sample correlated disease progression deltas for V5→V7 (~6 years)."""
     z = rng.standard_normal(6)
-
-    # Apply Cholesky factor to induce correlations from _DELTA_CORR.
-    # After this, corr_z[i] and corr_z[j] have correlation _DELTA_CORR[i,j].
     corr_z = _DELTA_CHOL @ z
 
-    # Map correlated normals to disease progression deltas:
-
-    # Contractility decline: abs() ensures it always decreases (negative delta).
-    # Scale 0.08 means ~1 SD of decline over 6 years is 8% of Sf_act.
-    # This is consistent with ~1-2% annual EF decline in HF populations.
-    delta_Sf_act = -abs(corr_z[0]) * 0.08
-
-    # Nephron function decline: abs() ensures Kf always decreases.
-    # Scale 0.10 means ~1 SD of decline is 10% of Kf over 6 years,
-    # consistent with ~2-4 mL/min/year eGFR decline in CKD stage 2-3.
-    delta_Kf = -abs(corr_z[1]) * 0.10
-
-    # Inflammation increase: abs() ensures it always rises.
-    # Scale 0.08 means ~1 SD of increase is 0.08 on the 0-1 scale.
-    # Chronic low-grade inflammation tends to worsen with aging.
-    delta_inflammation = abs(corr_z[2]) * 0.08
-
-    # Diabetes progression: abs() ensures it always worsens (HbA1c tends
-    # to drift up). Scale 0.05 reflects slow metabolic deterioration.
-    delta_diabetes = abs(corr_z[3]) * 0.05
-
-    # RAAS change: can go either way (medication changes, disease progression).
-    # Scale 0.15 allows moderate RAAS gain shifts.
-    delta_RAAS = corr_z[4] * 0.15
-
-    # Dietary Na change: bidirectional (patients may reduce Na on medical
-    # advice, or increase due to dietary drift). Scale 15 mEq/day.
-    delta_na = corr_z[5] * 15.0
-
     return {
-        'delta_Sf_act': delta_Sf_act,
-        'delta_Kf': delta_Kf,
-        'delta_inflammation': delta_inflammation,
-        'delta_diabetes': delta_diabetes,
-        'delta_RAAS': delta_RAAS,
-        'delta_na': delta_na,
+        'delta_Sf_act': -abs(corr_z[0]) * 0.08,
+        'delta_Kf': -abs(corr_z[1]) * 0.10,
+        'delta_inflammation': abs(corr_z[2]) * 0.08,
+        'delta_diabetes': abs(corr_z[3]) * 0.05,
+        'delta_RAAS': corr_z[4] * 0.15,
+        'delta_na': corr_z[5] * 15.0,
     }
 
 
 def generate_patient_params(rng: np.random.Generator) -> Dict:
-    """
-    Generate one synthetic patient's V5 and V7 parameter sets plus demographics.
-
-    Paper Reference: Section 3.7, "Patient Sampling Strategy"
-
-    The sampling distributions for each parameter are chosen to match the
-    ARIC Visit 5 population characteristics:
-      - Age 65-85 (uniform): ARIC V5 participants are elderly
-      - Sex 50/50: ARIC is roughly balanced by design
-      - BSA ~ N(1.9, 0.15): matches ARIC anthropometric distribution
-      - Height ~ N(1.70, 0.08): matches US elderly height distribution
-
-    Disease parameters use distributions that produce the right prevalence
-    of HFpEF, CKD, diabetes, etc. in the synthetic population:
-      - Sf_act ~ N(0.92, 0.12): most patients near-normal, tail into HFrEF
-      - Kf ~ Beta(5, 2): right-skewed, most near-normal, tail into CKD
-      - inflammation ~ Exp(0.10): most low, long tail into chronic inflammation
-      - diabetes: 75% zero, 25% uniform(0.1, 0.7) -- matches ~25% prevalence
-      - RAAS ~ N(1.5, 0.3): centered on default, moderate spread
-      - TGF ~ N(2.0, 0.3): centered on default
-      - Na intake ~ N(150, 40): typical Western diet with variation
-
-    Parameters
-    ----------
-    rng : np.random.Generator
-        Seeded random generator for reproducibility.
-
-    Returns
-    -------
-    dict with keys:
-        'v5_params' : dict of V5 disease parameters
-        'v7_params' : dict of V7 disease parameters (V5 + correlated deltas)
-        'demographics_v5' : dict with age, sex, BSA, height_m at Visit 5
-        'demographics_v7' : dict with age, sex, BSA, height_m at Visit 7
-    """
-
-    # -----------------------------------------------------------------------
-    # Demographics
-    # -----------------------------------------------------------------------
-    # Age: uniform over 65-85 to cover the ARIC V5 age range.
-    # Uniform (not normal) because ARIC actively enrolled across age strata.
+    """Generate one patient's V5 and V7 parameter sets plus demographics."""
     age_v5 = rng.uniform(65, 85)
-
-    # Sex: 50/50 coin flip. ARIC has roughly equal male/female enrollment.
     sex = 'M' if rng.random() < 0.5 else 'F'
-
-    # BSA (body surface area): normal with mean 1.9 m^2, SD 0.15 m^2.
-    # Clipped to [1.4, 2.5] to avoid unrealistic extremes.
-    # Used for indexing cardiac volumes (LVEDVi, LAVi, etc.).
     BSA = float(np.clip(rng.normal(1.9, 0.15), 1.4, 2.5))
-
-    # Height: normal with mean 1.70 m, SD 0.08 m (US elderly average).
-    # Clipped to [1.50, 1.95]. Used for LV mass indexing to height^2.7.
     height_m = float(np.clip(rng.normal(1.70, 0.08), 1.50, 1.95))
 
-    # V5 demographics (age at ARIC Visit 5)
     demographics_v5 = {'age': age_v5, 'sex': sex, 'BSA': BSA, 'height_m': height_m}
-
-    # V7 demographics: same person 6 years later. BSA and height assumed
-    # stable (elderly adults don't grow, and weight changes are captured
-    # indirectly through volume/Na balance in the renal model).
     demographics_v7 = {'age': age_v5 + 6.0, 'sex': sex, 'BSA': BSA, 'height_m': height_m}
 
-    # -----------------------------------------------------------------------
-    # V5 Baseline Disease Parameters
-    # -----------------------------------------------------------------------
-
-    # Sf_act_scale (active fiber stress / contractility):
-    # Normal ~ N(0.92, 0.12), clipped to [0.35, 1.0].
-    # Mean 0.92 (slightly below 1.0) reflects the mild age-related decline
-    # in systolic function in an elderly cohort. SD 0.12 places ~95% of
-    # patients between 0.68 and 1.0, with a tail down to 0.35 (moderate HFrEF).
+    # V5 baseline disease parameters
     Sf_act_v5 = float(np.clip(rng.normal(0.92, 0.12), 0.35, 1.0))
-
-    # Kf_scale (glomerular filtration capacity):
-    # Beta(5, 2) distribution, clipped to [0.3, 1.0].
-    # Beta(5,2) has mean 0.71 and is left-skewed, producing many patients
-    # with near-normal Kf (~0.8-1.0) but a substantial tail into moderate
-    # CKD (0.3-0.5). This matches the high CKD prevalence in elderly ARIC.
     Kf_v5 = float(np.clip(rng.beta(5, 2), 0.3, 1.0))
-
-    # inflammation_scale:
-    # Exponential(rate=1/0.10) = Exp(mean=0.10), clipped to [0.0, 0.6].
-    # Exponential is chosen because most elderly patients have low-grade
-    # inflammation (CRP slightly elevated), with a long right tail capturing
-    # the subset with significant chronic inflammatory conditions. The 0.6
-    # ceiling prevents extreme inflammation that would crash the model.
     inflammation_v5 = float(np.clip(rng.exponential(0.10), 0.0, 0.6))
-
-    # diabetes_scale:
-    # Mixture model: 75% zero (no diabetes) + 25% Uniform(0.1, 0.7).
-    # This produces ~25% diabetes prevalence, matching ARIC V5.
-    # Diabetic patients have severity uniformly distributed from mild (0.1)
-    # to moderately severe (0.7). The 4-element array with 3 zeros and 1
-    # nonzero implements the 75/25 mixture via random choice.
     diabetes_v5 = float(rng.choice(
         [0.0, 0.0, 0.0, np.clip(rng.uniform(0.1, 0.7), 0.0, 1.0)]
     ))
-
-    # RAAS_gain:
-    # Normal ~ N(1.5, 0.3), clipped to [0.8, 2.5].
-    # Centered on the default 1.5. Lower values represent patients on
-    # ACE-inhibitors/ARBs (pharmacologically suppressed RAAS). Higher
-    # values represent hyperactive RAAS (untreated HF, CKD with secondary
-    # hyperaldosteronism).
     RAAS_v5 = float(np.clip(rng.normal(1.5, 0.3), 0.8, 2.5))
-
-    # TGF_gain:
-    # Normal ~ N(2.0, 0.3), clipped to [1.0, 3.5].
-    # Centered on the default 2.0 (normal TGF responsiveness). Spread
-    # captures inter-individual variation in macula densa sensitivity.
     TGF_v5 = float(np.clip(rng.normal(2.0, 0.3), 1.0, 3.5))
-
-    # na_intake (dietary sodium):
-    # Normal ~ N(150, 40) mEq/day, clipped to [50, 300].
-    # 150 mEq/day is the average Western dietary sodium intake (~3.5g Na).
-    # SD of 40 captures the wide range from low-sodium diets (~50-80 mEq)
-    # to high-sodium diets (~200-300 mEq).
     na_v5 = float(np.clip(rng.normal(150, 40), 50, 300))
-
-    # k1_scale (passive myocardial stiffness):
-    # For non-diabetic patients: k1 = 1.0 (normal diastolic compliance).
-    # For diabetic patients: k1 = 1.0 + diabetes_scale * 0.5.
-    # This reflects the known association between diabetes and diastolic
-    # dysfunction: diabetic cardiomyopathy involves AGE cross-linking of
-    # collagen and titin, increasing passive myocardial stiffness. The
-    # scaling factor 0.5 means a diabetes_scale of 0.7 produces k1 = 1.35
-    # (moderate diastolic dysfunction). Clipped to [1.0, 2.0].
     k1_v5 = 1.0 if diabetes_v5 == 0.0 else float(np.clip(1.0 + diabetes_v5 * 0.5, 1.0, 2.0))
 
-    # Assemble V5 parameter dict
     v5_params = {
-        'Sf_act_scale': Sf_act_v5,
-        'Kf_scale': Kf_v5,
-        'inflammation_scale': inflammation_v5,
-        'diabetes_scale': diabetes_v5,
-        'k1_scale': k1_v5,
-        'RAAS_gain': RAAS_v5,
-        'TGF_gain': TGF_v5,
+        'Sf_act_scale': Sf_act_v5, 'Kf_scale': Kf_v5,
+        'inflammation_scale': inflammation_v5, 'diabetes_scale': diabetes_v5,
+        'k1_scale': k1_v5, 'RAAS_gain': RAAS_v5, 'TGF_gain': TGF_v5,
         'na_intake': na_v5,
     }
 
-    # -----------------------------------------------------------------------
-    # V5 -> V7 Disease Progression (Correlated Deltas)
-    # -----------------------------------------------------------------------
-    # Sample correlated deltas using the Cholesky-decomposed correlation
-    # matrix. These represent ~6 years of disease progression where
-    # cardiac, renal, inflammatory, and metabolic trajectories are
-    # statistically coupled as observed in longitudinal CRS studies.
     deltas = sample_correlated_deltas(rng)
-
-    # k1 progression: tied to diabetes progression because AGE-mediated
-    # myocardial stiffening is driven by cumulative hyperglycemic exposure.
-    # Factor 0.3 means every 0.1 increase in diabetes_scale over 6 years
-    # adds 0.03 to k1_scale. Note: abs() because diabetes only worsens
-    # (delta_diabetes is always positive due to abs() in sample_correlated_deltas).
     delta_k1 = abs(deltas['delta_diabetes']) * 0.3
 
-    # -----------------------------------------------------------------------
-    # V7 Parameters: V5 + Correlated Deltas, Clipped to Valid Ranges
-    # -----------------------------------------------------------------------
-    # Each V7 parameter is the V5 baseline plus the correlated delta,
-    # clipped to the valid range defined in config.TUNABLE_PARAMS.
-    # This ensures all V7 parameters remain physiologically plausible.
     v7_params = {
-        # Contractility: V5 + (negative) delta, clipped to [0.2, 1.0]
         'Sf_act_scale': float(np.clip(Sf_act_v5 + deltas['delta_Sf_act'],
                                        *TUNABLE_PARAMS['Sf_act_scale']['range'])),
-
-        # Nephron function: V5 + (negative) delta, clipped to [0.05, 1.0]
         'Kf_scale': float(np.clip(Kf_v5 + deltas['delta_Kf'],
                                    *TUNABLE_PARAMS['Kf_scale']['range'])),
-
-        # Inflammation: V5 + (positive) delta, clipped to [0.0, 1.0]
         'inflammation_scale': float(np.clip(inflammation_v5 + deltas['delta_inflammation'],
                                             *TUNABLE_PARAMS['inflammation_scale']['range'])),
-
-        # Diabetes: V5 + (positive) delta, clipped to [0.0, 1.0]
         'diabetes_scale': float(np.clip(diabetes_v5 + deltas['delta_diabetes'],
                                         *TUNABLE_PARAMS['diabetes_scale']['range'])),
-
-        # Diastolic stiffness: V5 + diabetes-driven delta, clipped to [1.0, 3.0]
         'k1_scale': float(np.clip(k1_v5 + delta_k1,
                                    *TUNABLE_PARAMS['k1_scale']['range'])),
-
-        # RAAS gain: V5 + (bidirectional) delta, clipped to [0.5, 3.0]
         'RAAS_gain': float(np.clip(RAAS_v5 + deltas['delta_RAAS'],
                                     *TUNABLE_PARAMS['RAAS_gain']['range'])),
-
-        # TGF gain: UNCHANGED from V5 to V7. TGF gain is considered a
-        # structural property of the juxtaglomerular apparatus that does
-        # not change appreciably over 6 years (unlike RAAS, which can
-        # change with medications and disease state).
         'TGF_gain': TGF_v5,
-
-        # Dietary sodium: V5 + (bidirectional) delta, clipped to [50, 300]
         'na_intake': float(np.clip(na_v5 + deltas['delta_na'],
                                     *TUNABLE_PARAMS['na_intake']['range'])),
     }
 
     return {
-        'v5_params': v5_params,
-        'v7_params': v7_params,
-        'demographics_v5': demographics_v5,
-        'demographics_v7': demographics_v7,
+        'v5_params': v5_params, 'v7_params': v7_params,
+        'demographics_v5': demographics_v5, 'demographics_v7': demographics_v7,
     }
 
 
-# ===========================================================================
-# Worker Function for Multiprocessing
-# ===========================================================================
-#
-# Paper Reference: Section 3.7, "Parallelized Cohort Generation"
-#
-# Each patient is processed independently: generate parameters, run V5
-# model, run V7 model, convert to numeric vectors. This is embarrassingly
-# parallel and distributed across n_workers processes using Python's
-# multiprocessing.Pool.
-# ===========================================================================
-
 def _process_patient(args: Tuple) -> Optional[Tuple[np.ndarray, np.ndarray, Dict]]:
-    """
-    Process one patient: generate V5 and V7 ARIC variable vectors.
-
-    This is the worker function called by multiprocessing.Pool.imap_unordered().
-    Each call is independent and receives a unique seed for reproducibility.
-
-    Parameters
-    ----------
-    args : tuple of (patient_idx: int, seed: int)
-        patient_idx is used only for progress tracking.
-        seed initializes this patient's random generator.
-
-    Returns
-    -------
-    tuple of (v5_vec, v7_vec, patient_metadata) or None
-        v5_vec : ndarray of shape (N_features,) -- V5 ARIC variables
-        v7_vec : ndarray of shape (N_features,) -- V7 ARIC variables
-        patient_metadata : dict with params and demographics
-        Returns None if either V5 or V7 model evaluation fails.
-    """
+    """Worker: generate one patient's V5 and V7 ARIC variable vectors."""
     patient_idx, seed = args
-
-    # Each patient gets its own RNG seeded deterministically from the
-    # master seed. This ensures reproducibility regardless of n_workers
-    # or processing order.
     rng = np.random.default_rng(seed)
-
-    # Generate V5 + V7 parameter sets and demographics
     patient = generate_patient_params(rng)
 
-    # -----------------------------------------------------------------------
-    # Evaluate V5 state: run coupled model at V5 parameters
-    # -----------------------------------------------------------------------
     v5_vars = evaluate_patient_state(
         patient['v5_params'], patient['demographics_v5'],
         n_coupling_steps=COHORT_DEFAULTS['n_coupling_steps'],
         dt_renal_hours=COHORT_DEFAULTS['dt_renal_hours'],
     )
     if v5_vars is None:
-        # CircAdapt failed to converge at V5 parameters; skip this patient.
         return None
 
-    # -----------------------------------------------------------------------
-    # Evaluate V7 state: run coupled model at V7 parameters
-    # -----------------------------------------------------------------------
     v7_vars = evaluate_patient_state(
         patient['v7_params'], patient['demographics_v7'],
         n_coupling_steps=COHORT_DEFAULTS['n_coupling_steps'],
         dt_renal_hours=COHORT_DEFAULTS['dt_renal_hours'],
     )
     if v7_vars is None:
-        # CircAdapt failed to converge at V7 parameters; skip this patient.
         return None
 
-    # -----------------------------------------------------------------------
-    # Convert variable dicts to ordered numeric vectors
-    # -----------------------------------------------------------------------
-    # NUMERIC_VAR_NAMES is a sorted list of ~100 variable names (from config.py).
-    # Both V5 and V7 must use the same ordering for the NN to work correctly.
-    # Missing variables default to 0.0 (should not happen with proper emission functions).
     v5_vec = np.array([float(v5_vars.get(k, 0.0)) for k in NUMERIC_VAR_NAMES])
     v7_vec = np.array([float(v7_vars.get(k, 0.0)) for k in NUMERIC_VAR_NAMES])
 
-    # -----------------------------------------------------------------------
-    # Sanity check: reject patients with NaN or Inf in any variable.
-    # -----------------------------------------------------------------------
-    # This catches rare numerical issues (e.g., division by near-zero in
-    # emission functions, log of negative number in biomarker calculations).
     if np.any(~np.isfinite(v5_vec)) or np.any(~np.isfinite(v7_vec)):
         return None
 
     return (v5_vec, v7_vec, patient)
 
 
-# ===========================================================================
-# Cohort Generation
-# ===========================================================================
-#
-# Paper Reference: Section 3.7, "Cohort Assembly"
-#
-# Orchestrates parallel generation of N synthetic patients, collects valid
-# results, and assembles them into (N_valid, D) arrays. The default is
-# N=10,000 patients with 8 workers.
-# ===========================================================================
-
-def generate_cohort(
+def generate_paired_cohort(
     n_patients: int = 10000,
     seed: int = 42,
     n_workers: int = 8,
 ) -> Tuple[np.ndarray, np.ndarray, list, list]:
-    """
-    Generate a full synthetic cohort of V5/V7 paired ARIC variable vectors.
-
-    This is the main entry point for cohort generation. It:
-      1. Creates a master RNG with the given seed
-      2. Derives per-patient seeds for reproducibility
-      3. Dispatches patient processing to a worker pool
-      4. Collects and filters results (removing failed patients)
-      5. Stacks valid results into NumPy arrays
-
-    Parameters
-    ----------
-    n_patients : int
-        Number of synthetic patients to attempt generating. Some will fail
-        (~1-5% depending on parameter extremes), so the output will have
-        slightly fewer patients.
-    seed : int
-        Master random seed for full reproducibility.
-    n_workers : int
-        Number of parallel worker processes. Use 1 for debugging (sequential
-        execution with progress updates every 100 patients).
+    """Generate paired V5/V7 ARIC variable vectors for NN training.
 
     Returns
     -------
-    v5_array : ndarray of shape (N_valid, N_features)
-        Visit 5 ARIC variables for each valid patient.
-    v7_array : ndarray of shape (N_valid, N_features)
-        Visit 7 ARIC variables for each valid patient.
+    v5_array : (N_valid, N_features)
+    v7_array : (N_valid, N_features)
     var_names : list of str
-        Ordered column names (matches NUMERIC_VAR_NAMES from config.py).
     patient_metadata : list of dicts
-        Demographics and disease parameters for each valid patient.
     """
     print(f"Generating {n_patients} synthetic patients (seed={seed}, workers={n_workers})...")
 
-    # Master RNG: all per-patient seeds are derived from this single seed,
-    # ensuring the entire cohort is reproducible.
     rng_master = np.random.default_rng(seed)
-
-    # Generate unique seeds for each patient. Using integers in [0, 2^31)
-    # ensures compatibility with np.random.default_rng.
     seeds = rng_master.integers(0, 2**31, size=n_patients)
-
-    # Build argument list: (patient_index, seed) tuples
     args_list = [(i, int(seeds[i])) for i in range(n_patients)]
 
     t0 = time.time()
 
     if n_workers <= 1:
-        # ---------------------------------------------------------------
-        # Sequential mode: useful for debugging (errors surface immediately).
-        # Progress updates every 100 patients with rate and ETA.
-        # ---------------------------------------------------------------
         results = []
         for i, args in enumerate(args_list):
             result = _process_patient(args)
@@ -1190,13 +418,6 @@ def generate_cohort(
                 eta = (n_patients - i - 1) / rate
                 print(f"  [{i+1}/{n_patients}] {rate:.1f} pts/s, ETA {eta:.0f}s")
     else:
-        # ---------------------------------------------------------------
-        # Parallel mode: multiprocessing Pool with imap_unordered.
-        # imap_unordered is used (vs imap) because patient order doesn't
-        # matter -- we shuffle the dataset during training anyway.
-        # chunksize=10 batches work to reduce IPC overhead.
-        # Progress updates every 200 patients.
-        # ---------------------------------------------------------------
         with Pool(n_workers) as pool:
             results = []
             for i, result in enumerate(pool.imap_unordered(_process_patient, args_list, chunksize=10)):
@@ -1209,58 +430,31 @@ def generate_cohort(
 
     elapsed = time.time() - t0
 
-    # -----------------------------------------------------------------------
-    # Filter out failed patients (None results)
-    # -----------------------------------------------------------------------
     valid_results = [r for r in results if r is not None]
     n_valid = len(valid_results)
     n_failed = n_patients - n_valid
     print(f"Done in {elapsed:.1f}s. Valid: {n_valid}/{n_patients} ({n_failed} failed)")
 
-    # -----------------------------------------------------------------------
-    # Assemble arrays: stack individual vectors into (N_valid, D) matrices
-    # -----------------------------------------------------------------------
     v5_list, v7_list, meta_list = [], [], []
     for v5_vec, v7_vec, patient in valid_results:
         v5_list.append(v5_vec)
         v7_list.append(v7_vec)
         meta_list.append(patient)
 
-    v5_array = np.stack(v5_list)   # Shape: (N_valid, N_features)
-    v7_array = np.stack(v7_list)   # Shape: (N_valid, N_features)
+    v5_array = np.stack(v5_list)
+    v7_array = np.stack(v7_list)
 
     return v5_array, v7_array, NUMERIC_VAR_NAMES, meta_list
 
 
 def load_real_aric_data(csv_path: str) -> Tuple[np.ndarray, np.ndarray, list, list]:
-    """
-    Load real ARIC V5/V7 paired data from a CSV file.
-
-    This function provides an alternative to synthetic data generation,
-    loading actual ARIC cohort data for model validation or fine-tuning.
-
-    Expected CSV format: columns matching NUMERIC_VAR_NAMES prefixed with
-    'v5_' and 'v7_' (e.g., 'v5_LVEF_pct', 'v7_LVEF_pct'). Missing columns
-    are filled with zeros and a warning is printed.
-
-    Parameters
-    ----------
-    csv_path : str
-        Path to the CSV file containing paired ARIC data.
-
-    Returns
-    -------
-    Same format as generate_cohort():
-        v5_array, v7_array, var_names, patient_metadata (empty list for real data)
-    """
+    """Load real ARIC V5/V7 paired data from CSV. Columns: v5_<var>, v7_<var>."""
     import pandas as pd
     df = pd.read_csv(csv_path)
 
-    # Expected column names with v5_/v7_ prefixes
     v5_cols = [f'v5_{k}' for k in NUMERIC_VAR_NAMES]
     v7_cols = [f'v7_{k}' for k in NUMERIC_VAR_NAMES]
 
-    # Check which columns are present in the CSV
     missing_v5 = [c for c in v5_cols if c not in df.columns]
     missing_v7 = [c for c in v7_cols if c not in df.columns]
     if missing_v5 or missing_v7:
@@ -1268,11 +462,9 @@ def load_real_aric_data(csv_path: str) -> Tuple[np.ndarray, np.ndarray, list, li
         print(f"Warning: {len(missing_v5)} V5 cols and {len(missing_v7)} V7 cols missing. "
               f"Using {len(available)} available columns, filling rest with 0.")
 
-    # Initialize arrays with zeros (default for missing columns)
     v5_array = np.zeros((len(df), len(NUMERIC_VAR_NAMES)))
     v7_array = np.zeros((len(df), len(NUMERIC_VAR_NAMES)))
 
-    # Fill in columns that exist in the CSV
     for i, var_name in enumerate(NUMERIC_VAR_NAMES):
         v5_col = f'v5_{var_name}'
         v7_col = f'v7_{var_name}'
@@ -1281,56 +473,831 @@ def load_real_aric_data(csv_path: str) -> Tuple[np.ndarray, np.ndarray, list, li
         if v7_col in df.columns:
             v7_array[:, i] = df[v7_col].values
 
-    # Return with empty metadata (not available for real data)
     return v5_array, v7_array, NUMERIC_VAR_NAMES, []
 
 
-# ===========================================================================
-# CLI (Command-Line Interface)
-# ===========================================================================
-#
-# Entry point for running cohort generation from the command line.
-# Generates the cohort, saves to .npz, and prints summary statistics.
-# ===========================================================================
+# Backward-compatible alias: old code calls generate_cohort() for paired mode
+generate_cohort = generate_paired_cohort
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: Monthly Cohort Generation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sample_demographics(n_patients, rng):
+    """Sample ARIC V5-like demographics (vectorized).
+
+    Returns dict with keys: age, sex, BSA, height_m, race.
+    """
+    age = rng.normal(75.0, 5.0, n_patients).clip(66, 90)
+    sex = rng.choice(['M', 'F'], size=n_patients, p=[0.43, 0.57])
+    race = rng.choice(['Black', 'White'], size=n_patients, p=[0.22, 0.78])
+
+    height_m = np.empty(n_patients)
+    BSA = np.empty(n_patients)
+    for i in range(n_patients):
+        if sex[i] == 'M':
+            height_m[i] = rng.normal(1.75, 0.07)
+            BSA[i] = rng.normal(2.0, 0.18)
+        else:
+            height_m[i] = rng.normal(1.62, 0.06)
+            BSA[i] = rng.normal(1.75, 0.16)
+    height_m = height_m.clip(1.45, 1.95)
+    BSA = BSA.clip(1.3, 2.6)
+
+    return {'age': age, 'sex': sex, 'BSA': BSA, 'height_m': height_m, 'race': race}
+
+
+def sample_disease_parameters(n_patients, rng):
+    """Sample baseline disease parameters (vectorized)."""
+    k1_scale = np.empty(n_patients)
+    healthy_mask = rng.random(n_patients) < 0.40
+    k1_scale[healthy_mask] = rng.uniform(1.0, 1.1, healthy_mask.sum())
+    k1_scale[~healthy_mask] = rng.uniform(1.0, 2.5, (~healthy_mask).sum())
+
+    Sf_scale = rng.normal(0.95, 0.08, n_patients).clip(0.5, 1.0)
+
+    Kf_scale = np.empty(n_patients)
+    kf_healthy = rng.random(n_patients) < 0.50
+    Kf_scale[kf_healthy] = rng.uniform(0.85, 1.0, kf_healthy.sum())
+    Kf_scale[~kf_healthy] = rng.beta(3, 2, (~kf_healthy).sum()) * 0.7 + 0.3
+
+    diabetes = np.empty(n_patients)
+    dm_mask = rng.random(n_patients) < 0.35
+    diabetes[dm_mask] = rng.beta(2, 3, dm_mask.sum())
+    diabetes[~dm_mask] = rng.uniform(0, 0.05, (~dm_mask).sum())
+
+    inflammation = rng.exponential(0.12, n_patients).clip(0, 0.8)
+    RAAS_gain = rng.normal(1.5, 0.3, n_patients).clip(0.5, 3.0)
+    TGF_gain = rng.normal(2.0, 0.4, n_patients).clip(1.0, 4.0)
+    na_intake = rng.normal(150, 30, n_patients).clip(80, 250)
+
+    return {
+        'k1_scale': k1_scale, 'Sf_scale': Sf_scale, 'Kf_scale': Kf_scale,
+        'diabetes': diabetes, 'inflammation': inflammation,
+        'RAAS_gain': RAAS_gain, 'TGF_gain': TGF_gain, 'na_intake': na_intake,
+    }
+
+
+def apply_disease_correlations(params, rng):
+    """Iman-Conover rank-based correlation induction for [d, k1, Kf, i]."""
+    keys = ['diabetes', 'k1_scale', 'Kf_scale', 'inflammation']
+    n = len(params[keys[0]])
+
+    target_corr = np.array([
+        [1.00,  0.35, -0.40,  0.30],
+        [0.35,  1.00, -0.25,  0.20],
+        [-0.40, -0.25, 1.00, -0.15],
+        [0.30,  0.20, -0.15,  1.00],
+    ])
+
+    L = np.linalg.cholesky(target_corr)
+
+    data = np.column_stack([params[k] for k in keys])
+    ranks = np.empty_like(data)
+    for j in range(4):
+        ranks[:, j] = stats.rankdata(data[:, j])
+
+    U = (ranks - 0.5) / n
+    Z = stats.norm.ppf(U)
+    Z_corr = (L @ Z.T).T
+
+    for j in range(4):
+        target_order = np.argsort(np.argsort(Z_corr[:, j]))
+        original_sorted = np.sort(data[:, j])
+        params[keys[j]] = original_sorted[target_order]
+
+    return params
+
+
+def generate_progression_schedule(params, n_months, rng):
+    """Generate per-month disease parameter trajectories (vectorized).
+
+    Returns dict of (n_patients, n_months) arrays.
+    """
+    n = len(params['k1_scale'])
+
+    # k1_scale
+    k1_annual_rate = rng.uniform(0.02, 0.10, n) * (1 + 0.5 * params['diabetes'])
+    k1_monthly = k1_annual_rate / 12.0
+    k1_sched = np.empty((n, n_months))
+    k1_sched[:, 0] = params['k1_scale']
+    for t in range(1, n_months):
+        noise = rng.normal(0, 0.002, n)
+        k1_sched[:, t] = k1_sched[:, t - 1] + k1_monthly + noise
+    k1_sched = k1_sched.clip(1.0, 3.0)
+
+    # Kf_scale (nonlinear: accelerates as Kf drops)
+    Kf_annual_rate = rng.uniform(0.01, 0.05, n) * (1 + 0.4 * params['diabetes'])
+    Kf_monthly = Kf_annual_rate / 12.0
+    Kf_sched = np.empty((n, n_months))
+    Kf_sched[:, 0] = params['Kf_scale']
+    for t in range(1, n_months):
+        accel = 1 + 0.5 * (1 - Kf_sched[:, t - 1])
+        noise = rng.normal(0, 0.001, n)
+        Kf_sched[:, t] = Kf_sched[:, t - 1] - Kf_monthly * accel + noise
+    Kf_sched = Kf_sched.clip(0.15, 1.0)
+
+    # Sf_scale
+    Sf_annual_rate = rng.uniform(0.002, 0.015, n) * (1 + 0.3 * params['diabetes'])
+    Sf_monthly = Sf_annual_rate / 12.0
+    Sf_sched = np.empty((n, n_months))
+    Sf_sched[:, 0] = params['Sf_scale']
+    for t in range(1, n_months):
+        noise = rng.normal(0, 0.001, n)
+        Sf_sched[:, t] = Sf_sched[:, t - 1] - Sf_monthly + noise
+    Sf_sched = Sf_sched.clip(0.4, 1.0)
+
+    # diabetes
+    dm_rate = np.where(
+        params['diabetes'] > 0.1,
+        rng.uniform(0.02, 0.06, n),
+        np.full(n, 0.005),
+    )
+    dm_monthly = dm_rate / 12.0
+    dm_sched = np.empty((n, n_months))
+    dm_sched[:, 0] = params['diabetes']
+    for t in range(1, n_months):
+        noise = rng.normal(0, 0.002, n)
+        dm_sched[:, t] = dm_sched[:, t - 1] + dm_monthly + noise
+    dm_sched = dm_sched.clip(0, 1)
+
+    # inflammation (drift + stochastic flares)
+    infl_drift = rng.uniform(0.001, 0.005, n) / 12.0
+    infl_sched = np.empty((n, n_months))
+    infl_sched[:, 0] = params['inflammation']
+    for t in range(1, n_months):
+        flare = (rng.random(n) < 0.02) * rng.uniform(0.05, 0.15, n)
+        infl_sched[:, t] = infl_sched[:, t - 1] + infl_drift + flare
+    infl_sched = infl_sched.clip(0, 0.8)
+
+    # Static parameters
+    RAAS_sched = np.tile(params['RAAS_gain'][:, None], (1, n_months))
+    TGF_sched = np.tile(params['TGF_gain'][:, None], (1, n_months))
+    na_sched = np.tile(params['na_intake'][:, None], (1, n_months))
+
+    return {
+        'k1_scale': k1_sched, 'Sf_scale': Sf_sched, 'Kf_scale': Kf_sched,
+        'diabetes': dm_sched, 'inflammation': infl_sched,
+        'RAAS_gain': RAAS_sched, 'TGF_gain': TGF_sched, 'na_intake': na_sched,
+    }
+
+
+def assign_phenotype_labels(params):
+    """Assign phenotype labels based on baseline disease parameters."""
+    n = len(params['k1_scale'])
+    labels = np.full(n, 'healthy', dtype='U20')
+
+    hfpef = params['k1_scale'] > 1.3
+    ckd = params['Kf_scale'] < 0.7
+    dm = params['diabetes'] > 0.3
+
+    cardiorenal = (hfpef & ckd) | (dm & (hfpef | ckd))
+    hfpef_dominant = hfpef & ~ckd & ~dm
+    ckd_dominant = ckd & ~hfpef & ~dm
+    diabetes_dominant = dm & ~hfpef & ~ckd
+
+    labels[hfpef_dominant] = 'hfpef_dominant'
+    labels[ckd_dominant] = 'ckd_dominant'
+    labels[diabetes_dominant] = 'diabetes_dominant'
+    labels[cardiorenal] = 'cardiorenal'
+
+    return labels
+
+
+def generate_single_patient_trajectory(patient_idx, demo, schedule, n_months,
+                                        var_names, cystatin_params, use_circadapt):
+    """Generate one patient's monthly trajectory of 20 clinical variables.
+
+    Tries CircAdapt first; falls back to parametric model.
+    """
+    if use_circadapt:
+        try:
+            return _run_circadapt_trajectory(n_months, schedule, demo, cystatin_params)
+        except Exception:
+            pass
+
+    return _parametric_trajectory(n_months, schedule, demo, cystatin_params)
+
+
+def _run_circadapt_trajectory(n_months, schedule, demo, cystatin_params):
+    """Run CircAdapt at yearly resolution and cubic-interpolate to monthly."""
+    from cardiorenal_coupling import run_coupled_simulation
+
+    k1_sched = schedule['k1_scale']
+    Sf_sched = schedule['Sf_scale']
+    Kf_sched = schedule['Kf_scale']
+    dm_sched = schedule['diabetes']
+    infl_sched = schedule['inflammation']
+
+    age = demo['age']
+    sex = demo['sex']
+    BSA = demo['BSA']
+
+    n_years = max(n_months // 12, 2)
+    yearly_indices = np.linspace(0, n_months - 1, n_years, dtype=int)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        hist = run_coupled_simulation(
+            n_steps=n_years,
+            dt_renal_hours=6.0,
+            cardiac_schedule=[float(Sf_sched[i]) for i in yearly_indices],
+            kidney_schedule=[float(Kf_sched[i]) for i in yearly_indices],
+            stiffness_schedule=[float(k1_sched[i]) for i in yearly_indices],
+            inflammation_schedule=[float(infl_sched[i]) for i in yearly_indices],
+            diabetes_schedule=[float(dm_sched[i]) for i in yearly_indices],
+        )
+
+    if any(np.isnan(v) for v in hist.get('MAP', [0])):
+        raise RuntimeError("CircAdapt diverged")
+
+    n_vars = len(VAR_NAMES)
+    yearly_data = np.empty((n_years, n_vars), dtype=np.float32)
+
+    for s in range(n_years):
+        yearly_data[s, VAR_IDX['SBP_mmHg']] = hist['SBP'][s]
+        yearly_data[s, VAR_IDX['MAP_mmHg']] = hist['MAP'][s]
+        yearly_data[s, VAR_IDX['CO_L_min']] = hist['CO'][s]
+        yearly_data[s, VAR_IDX['LVEF_pct']] = hist['EF'][s]
+        yearly_data[s, VAR_IDX['eGFR_mL_min']] = hist['GFR'][s]
+
+        CO = max(hist['CO'][s], 0.5)
+        MAP = hist['MAP'][s]
+        CVP = 5.0
+        yearly_data[s, VAR_IDX['SVR_wood']] = (MAP - CVP) / CO
+
+        GFR = max(hist['GFR'][s], 5.0)
+        infl_t = infl_sched[yearly_indices[s]]
+        yearly_data[s, VAR_IDX['creatinine_mg_dL']] = (
+            90.0 / GFR if sex == 'M' else 60.0 / GFR
+        )
+        yearly_data[s, VAR_IDX['cystatin_C_mg_L']] = (
+            cystatin_params['D_cys'] / GFR * (1 + cystatin_params['epsilon'] * infl_t)
+        )
+        yearly_data[s, VAR_IDX['UACR_mg_g']] = max(
+            5.0 * (1 + 2.0 * (1 - Kf_sched[yearly_indices[s]])) *
+            (1 + 0.5 * dm_sched[yearly_indices[s]]), 0.5
+        )
+
+        SV = hist['SV'][s]
+        EF = hist['EF'][s]
+        EDV = SV / max(EF / 100, 0.1)
+        yearly_data[s, VAR_IDX['LVIDd_cm']] = 0.895 * EDV ** (1/3)
+
+        k1_t = k1_sched[yearly_indices[s]]
+        yearly_data[s, VAR_IDX['LVmass_g']] = 150 * (1 + 0.15 * (k1_t - 1))
+        yearly_data[s, VAR_IDX['GLS_pct']] = -18 * (EF / 65) * Sf_sched[yearly_indices[s]]
+        yearly_data[s, VAR_IDX['E_cm_s']] = 68 * (1 + 0.2 * (k1_t - 1))
+        yearly_data[s, VAR_IDX['e_prime_sept_cm_s']] = 5.7 / k1_t
+        yearly_data[s, VAR_IDX['E_over_e_prime_sept']] = (
+            yearly_data[s, VAR_IDX['E_cm_s']] /
+            max(yearly_data[s, VAR_IDX['e_prime_sept_cm_s']], 1.0)
+        )
+        yearly_data[s, VAR_IDX['E_over_A_ratio']] = 0.86 / (1 + 0.15 * (k1_t - 1))
+        yearly_data[s, VAR_IDX['LAvolume_mL']] = 49 * (1 + 0.2 * (k1_t - 1))
+        yearly_data[s, VAR_IDX['PASP_mmHg']] = 28 + 5 * (k1_t - 1) + 0.1 * (MAP - 93)
+
+        LVEDP_est = 10 * k1_t
+        yearly_data[s, VAR_IDX['NTproBNP_pg_mL']] = (
+            50 * np.exp(0.05 * LVEDP_est + 0.02 * CVP + 0.003 * 150 / BSA)
+        )
+        yearly_data[s, VAR_IDX['CRP_mg_L']] = (
+            2.0 * np.exp(3.0 * infl_t + 1.5 * dm_sched[yearly_indices[s]])
+        )
+
+    # Cubic interpolation to monthly
+    x_yearly = np.array(yearly_indices, dtype=float)
+    x_monthly = np.arange(n_months, dtype=float)
+    trajectory = np.empty((n_months, len(VAR_NAMES)), dtype=np.float32)
+    for j in range(len(VAR_NAMES)):
+        f = interp1d(x_yearly, yearly_data[:, j], kind='cubic',
+                     fill_value='extrapolate')
+        trajectory[:, j] = f(x_monthly)
+
+    for j, vn in enumerate(VAR_NAMES):
+        lo, hi = CORE_20_VARIABLES[vn]['physiological_bounds']
+        trajectory[:, j] = trajectory[:, j].clip(lo, hi)
+
+    return trajectory
+
+
+def _parametric_trajectory(n_months, schedule, demo, cystatin_params):
+    """Parametric trajectory generation (no CircAdapt dependency)."""
+    k1_sched = schedule['k1_scale']
+    Sf_sched = schedule['Sf_scale']
+    Kf_sched = schedule['Kf_scale']
+    dm_sched = schedule['diabetes']
+    infl_sched = schedule['inflammation']
+    RAAS_val = schedule['RAAS_gain'][0]
+    TGF_val = schedule['TGF_gain'][0]
+    na_val = schedule['na_intake'][0]
+
+    age = demo['age']
+    sex = demo['sex']
+    BSA = demo['BSA']
+
+    n_vars = len(VAR_NAMES)
+    traj = np.empty((n_months, n_vars), dtype=np.float32)
+
+    for t in range(n_months):
+        k1 = k1_sched[t]
+        Sf = Sf_sched[t]
+        Kf = Kf_sched[t]
+        d = dm_sched[t]
+        i = infl_sched[t]
+
+        MAP_base = 93 + 5 * (RAAS_val - 1.5) + 3 * d + 2 * i + 0.05 * (na_val - 150)
+        CO_base = 4.6 * Sf * (1 - 0.1 * (k1 - 1)) * (1 - 0.05 * i)
+        CO = max(CO_base, 1.5)
+        SBP = MAP_base * 1.4 * (1 + 0.02 * (k1 - 1))
+        MAP = MAP_base
+        CVP = 5.0 + 2 * (k1 - 1) + 1 * (1 - Kf) + 0.5 * d
+        SVR = (MAP - CVP) / max(CO, 0.5)
+
+        EDV = 120 * (1 + 0.05 * (1 - Sf)) * (1 - 0.03 * (k1 - 1))
+        ESV = EDV * (1 - Sf * 0.65 * (1 - 0.1 * (k1 - 1)))
+        ESV = max(ESV, EDV * 0.15)
+        EF = (EDV - ESV) / EDV * 100
+        SV = EDV - ESV
+
+        LVIDd = 0.895 * EDV ** (1/3)
+        LVmass = 150 * (1 + 0.15 * (k1 - 1) + 0.1 * d)
+        GLS = -18 * (EF / 65) * Sf
+
+        E = 68 * (1 + 0.20 * (k1 - 1) + 0.15 * (1 - Kf))
+        e_prime = max(5.7 / (k1 * (1 + 0.1 * i)), 1.5)
+        E_e_prime = E / e_prime
+        E_A = 0.86 / (1 + 0.15 * (k1 - 1))
+        if k1 > 2.0:
+            E_A = 0.86 + 0.5 * (k1 - 2.0)
+
+        LAv = 49 * (1 + 0.20 * (k1 - 1) + 0.10 * d)
+        PASP = 28 + 5 * (k1 - 1) + 3 * (1 - Kf) + 0.1 * (MAP - 93)
+
+        GFR = max(120 * Kf * (1 - 0.1 * d) * (1 - 0.05 * i) * (MAP / 93) ** 0.3, 3.0)
+        eGFR = max(GFR * 0.55, 3.0)
+        cr_base = 90.0 if sex == 'M' else 72.0
+        creatinine = cr_base / max(GFR, 5.0)
+        UACR = max(5.0 * (1 + 2.0 * (1 - Kf)) * (1 + 0.5 * d), 0.5)
+        sex_factor = 0.95 if sex == 'F' else 1.0
+        cystatin = cystatin_params['D_cys'] / max(GFR, 5.0) * (
+            1 + cystatin_params['epsilon'] * i
+        ) * sex_factor
+
+        LVEDP_est = 10 * k1
+        NTproBNP = 50 * np.exp(0.05 * LVEDP_est + 0.02 * CVP + 0.003 * LVmass / BSA)
+        CRP = 2.0 * np.exp(3.0 * i + 1.5 * d)
+
+        traj[t, VAR_IDX['LVIDd_cm']] = LVIDd
+        traj[t, VAR_IDX['LVmass_g']] = LVmass
+        traj[t, VAR_IDX['LVEF_pct']] = EF
+        traj[t, VAR_IDX['GLS_pct']] = GLS
+        traj[t, VAR_IDX['CO_L_min']] = CO
+        traj[t, VAR_IDX['E_cm_s']] = E
+        traj[t, VAR_IDX['e_prime_sept_cm_s']] = e_prime
+        traj[t, VAR_IDX['E_over_e_prime_sept']] = E_e_prime
+        traj[t, VAR_IDX['E_over_A_ratio']] = E_A
+        traj[t, VAR_IDX['LAvolume_mL']] = LAv
+        traj[t, VAR_IDX['PASP_mmHg']] = PASP
+        traj[t, VAR_IDX['SBP_mmHg']] = SBP
+        traj[t, VAR_IDX['MAP_mmHg']] = MAP
+        traj[t, VAR_IDX['SVR_wood']] = SVR
+        traj[t, VAR_IDX['eGFR_mL_min']] = eGFR
+        traj[t, VAR_IDX['creatinine_mg_dL']] = creatinine
+        traj[t, VAR_IDX['UACR_mg_g']] = UACR
+        traj[t, VAR_IDX['cystatin_C_mg_L']] = cystatin
+        traj[t, VAR_IDX['NTproBNP_pg_mL']] = NTproBNP
+        traj[t, VAR_IDX['CRP_mg_L']] = CRP
+
+    for j, vn in enumerate(VAR_NAMES):
+        lo, hi = CORE_20_VARIABLES[vn]['physiological_bounds']
+        traj[:, j] = traj[:, j].clip(lo, hi)
+
+    return traj
+
+
+def add_measurement_noise(trajectories, var_names, rng):
+    """Add realistic measurement noise and PASP missingness.
+
+    Parameters
+    ----------
+    trajectories : (N, T, 20) clean values
+    var_names : list of str
+    rng : numpy random Generator
+
+    Returns
+    -------
+    noisy : (N, T, 20) with PASP NaNs
+    """
+    N, T, V = trajectories.shape
+    noisy = trajectories.copy()
+
+    for j, vn in enumerate(var_names):
+        noise_type, magnitude = MEASUREMENT_NOISE[vn]
+        if noise_type == 'gaussian_absolute':
+            noisy[:, :, j] += rng.normal(0, magnitude, (N, T))
+        elif noise_type == 'gaussian_relative':
+            noisy[:, :, j] *= rng.normal(1, magnitude, (N, T))
+
+        lo, hi = CORE_20_VARIABLES[vn]['physiological_bounds']
+        noisy[:, :, j] = noisy[:, :, j].clip(lo, hi)
+
+    # PASP missingness model
+    pasp_idx = var_names.index('PASP_mmHg')
+    pasp_vals = noisy[:, :, pasp_idx]
+    p_miss = PASP_MISSING_PARAMS['base_missing_prob'] + \
+        PASP_MISSING_PARAMS['pasp_slope'] * (pasp_vals - 25)
+    p_miss = p_miss.clip(0.10, 0.60)
+    miss_mask = rng.random((N, T)) < p_miss
+    noisy[:, :, pasp_idx] = np.where(miss_mask, np.nan, noisy[:, :, pasp_idx])
+
+    return noisy
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: Validation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def validate_cystatin_c(params=None):
+    """Run 7 validation checks for cystatin C emission model. Returns True if all pass."""
+    if params is None:
+        params = CYSTATIN_C_PARAMS
+
+    D_cys = params["D_cys"]
+    eps = params["epsilon"]
+
+    checks = [
+        ("Healthy (GFR=100, i=0)",      100, 0.0, 0.60, 1.00),
+        ("Mild CKD (GFR=60, i=0)",       60, 0.0, 1.10, 1.50),
+        ("Mod CKD (GFR=30, i=0)",        30, 0.0, 2.00, 3.50),
+        ("Inflamed (GFR=60, i=0.5)",      60, 0.5, 1.25, 1.80),
+        ("Severe inflam (GFR=60, i=1)",   60, 1.0, 1.45, 2.10),
+    ]
+
+    print(f"\n{'Check':<35} {'GFR':>5} {'i':>5} {'CysC':>7} "
+          f"{'Range':>12} {'Status':>8}")
+    print("-" * 75)
+
+    all_pass = True
+    for label, gfr, inflam, lo, hi in checks:
+        cys_c = D_cys / gfr * (1 + eps * inflam)
+        status = "PASS" if lo <= cys_c <= hi else "FAIL"
+        if status == "FAIL":
+            all_pass = False
+        print(f"{label:<35} {gfr:>5} {inflam:>5.1f} {cys_c:>7.2f} "
+              f"[{lo:.2f}-{hi:.2f}] {status:>8}")
+
+    # CKD-EPI cross-check
+    cys_c_test = D_cys / 60.0
+    age_test = 75
+    ratio = cys_c_test / 0.8
+    if ratio <= 1:
+        egfr_cys = 133 * (ratio ** -0.499) * (0.996 ** age_test)
+    else:
+        egfr_cys = 133 * (ratio ** -1.328) * (0.996 ** age_test)
+    pct_error = abs(egfr_cys - 60) / 60 * 100
+    status = "PASS" if pct_error < 30 else "FAIL"
+    if status == "FAIL":
+        all_pass = False
+    print(f"\nCKD-EPI cross-check: CysC={cys_c_test:.2f} -> "
+          f"eGFR_cys={egfr_cys:.1f} (true=60, err={pct_error:.1f}%) {status}")
+
+    # Population check
+    pop_cys = D_cys / 66.0 * (1 + eps * 0.12)
+    status = "PASS" if 0.90 <= pop_cys <= 1.30 else "FAIL"
+    if status == "FAIL":
+        all_pass = False
+    print(f"Pop-level check: GFR=66, i=0.12 -> CysC={pop_cys:.2f} "
+          f"(target: 1.10+/-0.20) {status}")
+
+    return all_pass
+
+
+def validate_marginals(trajectories, var_names):
+    """Compare month-0 distributions to ARIC V5 targets."""
+    print(f"\n{'Variable':<25} {'Synth Mean':>10} {'Synth SD':>10} "
+          f"{'V5 Mean':>10} {'V5 SD':>10} {'Dev (SDs)':>10} {'Status':>8}")
+    print("-" * 85)
+
+    n_warn = 0
+    n_fail = 0
+    for j, vn in enumerate(var_names):
+        meta = CORE_20_VARIABLES[vn]
+        synth_vals = trajectories[:, 0, j]
+        valid = synth_vals[~np.isnan(synth_vals)]
+        if len(valid) == 0:
+            continue
+        synth_mean = np.mean(valid)
+        synth_sd = np.std(valid)
+        v5_mean = meta['v5_mean']
+        v5_sd = meta['v5_sd']
+        dev = abs(synth_mean - v5_mean) / v5_sd if v5_sd > 0 else 0
+
+        if dev > 2.0:
+            status = "FAIL"
+            n_fail += 1
+        elif dev > 1.0:
+            status = "WARN"
+            n_warn += 1
+        else:
+            status = "OK"
+
+        print(f"{vn:<25} {synth_mean:>10.2f} {synth_sd:>10.2f} "
+              f"{v5_mean:>10.2f} {v5_sd:>10.2f} {dev:>10.2f} {status:>8}")
+
+    print(f"\nSummary: {n_fail} FAIL, {n_warn} WARN, "
+          f"{len(var_names) - n_fail - n_warn} OK")
+
+
+def validate_trajectories(trajectories, var_names, labels):
+    """Plausibility checks on generated trajectories. Returns True if all pass."""
+    all_pass = True
+    print("\n--- Trajectory Plausibility Checks ---")
+
+    ef_idx = var_names.index('LVEF_pct')
+    egfr_idx = var_names.index('eGFR_mL_min')
+    ee_idx = var_names.index('E_over_e_prime_sept')
+    bnp_idx = var_names.index('NTproBNP_pg_mL')
+    cys_idx = var_names.index('cystatin_C_mg_L')
+    cr_idx = var_names.index('creatinine_mg_dL')
+
+    # 1. HFpEF: LVEF stays >50% for >85% of trajectory
+    hfpef_mask = labels == 'hfpef_dominant'
+    if hfpef_mask.sum() > 0:
+        ef_vals = trajectories[hfpef_mask, :, ef_idx]
+        pct_above_50 = (ef_vals > 50).mean(axis=1)
+        pass_rate = (pct_above_50 > 0.85).mean()
+        status = "PASS" if pass_rate > 0.70 else "FAIL"
+        if status == "FAIL":
+            all_pass = False
+        print(f"1. HFpEF LVEF>50% for >85% of traj: {pass_rate:.1%} pass [{status}]")
+    else:
+        print("1. HFpEF check: no hfpef_dominant patients [SKIP]")
+
+    # 2. CKD: eGFR declines in >80%
+    ckd_mask = (labels == 'ckd_dominant') | (labels == 'cardiorenal')
+    if ckd_mask.sum() > 0:
+        egfr_start = trajectories[ckd_mask, 0, egfr_idx]
+        egfr_end = trajectories[ckd_mask, -1, egfr_idx]
+        decline_rate = (egfr_end < egfr_start).mean()
+        status = "PASS" if decline_rate > 0.80 else "FAIL"
+        if status == "FAIL":
+            all_pass = False
+        print(f"2. CKD eGFR decline: {decline_rate:.1%} decline [{status}]")
+    else:
+        print("2. CKD eGFR decline: no CKD patients [SKIP]")
+
+    # 3. Cardiorenal: E/e' increases in >70%
+    cr_mask = labels == 'cardiorenal'
+    if cr_mask.sum() > 0:
+        ee_start = trajectories[cr_mask, 0, ee_idx]
+        ee_end = trajectories[cr_mask, -1, ee_idx]
+        increase_rate = (ee_end > ee_start).mean()
+        status = "PASS" if increase_rate > 0.70 else "FAIL"
+        if status == "FAIL":
+            all_pass = False
+        print(f"3. Cardiorenal E/e' increase: {increase_rate:.1%} increase [{status}]")
+    else:
+        print("3. Cardiorenal E/e' increase: no cardiorenal patients [SKIP]")
+
+    # 4. log(NT-proBNP) <-> E/e' correlation > 0.3
+    for t_check in [0, trajectories.shape[1] // 2, trajectories.shape[1] - 1]:
+        bnp_vals = trajectories[:, t_check, bnp_idx]
+        ee_vals = trajectories[:, t_check, ee_idx]
+        valid = ~(np.isnan(bnp_vals) | np.isnan(ee_vals)) & (bnp_vals > 0)
+        if valid.sum() > 10:
+            corr = np.corrcoef(np.log(bnp_vals[valid]), ee_vals[valid])[0, 1]
+            status = "PASS" if corr > 0.3 else "FAIL"
+            if status == "FAIL":
+                all_pass = False
+            print(f"4. log(BNP) vs E/e' corr at t={t_check}: {corr:.3f} [{status}]")
+
+    # 5. Cystatin C <-> creatinine correlation > 0.7
+    for t_check in [0, trajectories.shape[1] - 1]:
+        cys_vals = trajectories[:, t_check, cys_idx]
+        cr_vals = trajectories[:, t_check, cr_idx]
+        valid = ~(np.isnan(cys_vals) | np.isnan(cr_vals))
+        if valid.sum() > 10:
+            corr = np.corrcoef(cys_vals[valid], cr_vals[valid])[0, 1]
+            status = "PASS" if corr > 0.7 else "FAIL"
+            if status == "FAIL":
+                all_pass = False
+            print(f"5. CysC vs creatinine corr at t={t_check}: {corr:.3f} [{status}]")
+
+    # 6. eGFR <-> creatinine correlation < -0.5
+    for t_check in [0, trajectories.shape[1] - 1]:
+        egfr_vals = trajectories[:, t_check, egfr_idx]
+        cr_vals = trajectories[:, t_check, cr_idx]
+        valid = ~(np.isnan(egfr_vals) | np.isnan(cr_vals))
+        if valid.sum() > 10:
+            corr = np.corrcoef(egfr_vals[valid], cr_vals[valid])[0, 1]
+            status = "PASS" if corr < -0.5 else "FAIL"
+            if status == "FAIL":
+                all_pass = False
+            print(f"6. eGFR vs creatinine corr at t={t_check}: {corr:.3f} [{status}]")
+
+    # 7. No eGFR<10 AND LVEF>70%
+    bad = (trajectories[:, :, egfr_idx] < 10) & (trajectories[:, :, ef_idx] > 70)
+    n_bad = bad.any(axis=1).sum()
+    status = "PASS" if n_bad == 0 else "FAIL"
+    if status == "FAIL":
+        all_pass = False
+    print(f"7. eGFR<10 & LVEF>70% implausible combos: {n_bad} patients [{status}]")
+
+    return all_pass
+
+
+def _monthly_worker_fn(args):
+    """Worker for multiprocessing monthly patient generation."""
+    idx, demo_dict, schedule_dict, n_months, var_names, cystatin_params, use_circadapt = args
+    return generate_single_patient_trajectory(
+        idx, demo_dict, schedule_dict, n_months, var_names,
+        cystatin_params, use_circadapt,
+    )
+
+
+def generate_monthly_cohort(n_patients, n_months, n_workers, seed, validate,
+                             output_path='cohort_monthly.npz'):
+    """Generate monthly-resolution synthetic cohort (N, T, 20).
+
+    Steps: demographics → disease params → correlations → progression →
+    phenotypes → trajectories → noise → validate → save.
+    """
+    rng = np.random.default_rng(seed)
+    t_start = time.time()
+
+    print(f"[1/8] Sampling demographics for {n_patients} patients...")
+    demographics = sample_demographics(n_patients, rng)
+
+    print("[2/8] Sampling disease parameters...")
+    params = sample_disease_parameters(n_patients, rng)
+    params = apply_disease_correlations(params, rng)
+
+    print(f"[3/8] Generating {n_months}-month progression schedules...")
+    schedules = generate_progression_schedule(params, n_months, rng)
+
+    print("[4/8] Assigning phenotype labels...")
+    labels = assign_phenotype_labels(params)
+    unique, counts = np.unique(labels, return_counts=True)
+    for lab, cnt in zip(unique, counts):
+        print(f"  {lab}: {cnt} ({cnt/n_patients*100:.1f}%)")
+
+    # Check CircAdapt availability
+    use_circadapt = False
+    try:
+        from cardiorenal_coupling import run_coupled_simulation
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            test_hist = run_coupled_simulation(n_steps=2, dt_renal_hours=6.0)
+        if any(np.isnan(v) for v in test_hist.get('MAP', [0])):
+            raise RuntimeError("CircAdapt produces NaN")
+        use_circadapt = True
+        print("[5/8] CircAdapt available — using coupled simulator with interpolation")
+    except Exception as e:
+        print(f"[5/8] CircAdapt unavailable ({e}) — using parametric fallback")
+
+    print(f"[6/8] Generating trajectories ({n_workers} workers)...")
+    worker_args = []
+    for i in range(n_patients):
+        demo_i = {k: v[i] for k, v in demographics.items()}
+        sched_i = {k: v[i] for k, v in schedules.items()}
+        worker_args.append((
+            i, demo_i, sched_i, n_months, VAR_NAMES,
+            CYSTATIN_C_PARAMS, use_circadapt,
+        ))
+
+    if n_workers <= 1:
+        results = []
+        for i, args in enumerate(worker_args):
+            results.append(_monthly_worker_fn(args))
+            if (i + 1) % max(1, n_patients // 10) == 0:
+                print(f"  {i+1}/{n_patients} patients done "
+                      f"({(i+1)/n_patients*100:.0f}%)")
+    else:
+        with mp.Pool(n_workers) as pool:
+            results = []
+            for i, result in enumerate(pool.imap(
+                _monthly_worker_fn, worker_args,
+                chunksize=max(1, n_patients // (n_workers * 4))
+            )):
+                results.append(result)
+                if (i + 1) % max(1, n_patients // 10) == 0:
+                    print(f"  {i+1}/{n_patients} patients done "
+                          f"({(i+1)/n_patients*100:.0f}%)")
+
+    trajectories_clean = np.stack(results, axis=0)
+    print(f"  Clean trajectories shape: {trajectories_clean.shape}")
+
+    print("[7/8] Adding measurement noise...")
+    trajectories_noisy = add_measurement_noise(trajectories_clean, VAR_NAMES, rng)
+
+    pasp_idx = VAR_NAMES.index('PASP_mmHg')
+    non_pasp_nans = np.isnan(trajectories_noisy[:, :, :pasp_idx]).sum() + \
+                    np.isnan(trajectories_noisy[:, :, pasp_idx+1:]).sum()
+    pasp_nans = np.isnan(trajectories_noisy[:, :, pasp_idx]).sum()
+    print(f"  PASP NaN count: {pasp_nans} "
+          f"({pasp_nans / (n_patients * n_months) * 100:.1f}%)")
+    if non_pasp_nans > 0:
+        print(f"  WARNING: {non_pasp_nans} unexpected NaNs in non-PASP variables!")
+
+    if validate:
+        print("[8/8] Running validation...")
+        cysc_ok = validate_cystatin_c()
+        validate_marginals(trajectories_noisy, VAR_NAMES)
+        traj_ok = validate_trajectories(trajectories_clean, VAR_NAMES, labels)
+        if cysc_ok and traj_ok:
+            print("\nAll validations PASSED.")
+        else:
+            print("\nSome validations FAILED — review output above.")
+    else:
+        print("[8/8] Skipping validation (use --validate to enable)")
+
+    print(f"\nSaving to {output_path}...")
+    np.savez_compressed(
+        output_path,
+        trajectories=trajectories_noisy.astype(np.float32),
+        trajectories_clean=trajectories_clean.astype(np.float32),
+        var_names=np.array(VAR_NAMES),
+        demographics_age=demographics['age'],
+        demographics_sex=demographics['sex'],
+        demographics_BSA=demographics['BSA'],
+        demographics_height_m=demographics['height_m'],
+        demographics_race=demographics['race'],
+        disease_k1_scale=schedules['k1_scale'].astype(np.float32),
+        disease_Sf_scale=schedules['Sf_scale'].astype(np.float32),
+        disease_Kf_scale=schedules['Kf_scale'].astype(np.float32),
+        disease_diabetes=schedules['diabetes'].astype(np.float32),
+        disease_inflammation=schedules['inflammation'].astype(np.float32),
+        disease_RAAS_gain=schedules['RAAS_gain'].astype(np.float32),
+        disease_TGF_gain=schedules['TGF_gain'].astype(np.float32),
+        disease_na_intake=schedules['na_intake'].astype(np.float32),
+        phenotype_labels=labels,
+        metadata=np.array([{
+            'n_patients': n_patients,
+            'n_months': n_months,
+            'seed': seed,
+            'use_circadapt': use_circadapt,
+            'generation_time_s': time.time() - t_start,
+        }]),
+    )
+
+    elapsed = time.time() - t_start
+    print(f"Done. {n_patients} patients x {n_months} months x 20 vars "
+          f"in {elapsed:.1f}s")
+    print(f"Output: {output_path} "
+          f"({trajectories_noisy.nbytes / 1e6:.1f} MB uncompressed)")
+
+    return trajectories_noisy, trajectories_clean
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate synthetic ARIC V5/V7 cohort')
-    parser.add_argument('--n_patients', type=int, default=COHORT_DEFAULTS['n_patients'],
-                        help='Number of patients to generate (default: 10000)')
-    parser.add_argument('--seed', type=int, default=COHORT_DEFAULTS['seed'],
-                        help='Random seed for reproducibility (default: 42)')
-    parser.add_argument('--n_workers', type=int, default=COHORT_DEFAULTS['n_workers'],
-                        help='Number of parallel workers (default: 8, use 1 for debugging)')
-    parser.add_argument('--output', type=str, default='cohort_data.npz',
-                        help='Output file path (.npz)')
+    parser = argparse.ArgumentParser(description='Generate synthetic cardiorenal cohort')
+    parser.add_argument('--mode', choices=['paired', 'monthly'], default='paired',
+                        help='paired = V5/V7 for NN training, monthly = trajectories for RL')
+    parser.add_argument('--n_patients', type=int, default=None)
+    parser.add_argument('--n_months', type=int, default=96,
+                        help='Months for monthly mode (default 96 = 8 years)')
+    parser.add_argument('--n_workers', type=int, default=8)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--validate', action='store_true',
+                        help='Run validation checks (monthly mode)')
+    parser.add_argument('--output', type=str, default=None)
     args = parser.parse_args()
 
-    # Generate the cohort
-    v5, v7, var_names, metadata = generate_cohort(
-        n_patients=args.n_patients,
-        seed=args.seed,
-        n_workers=args.n_workers,
-    )
+    if args.mode == 'paired':
+        n_patients = args.n_patients or COHORT_DEFAULTS['n_patients']
+        output = args.output or 'cohort_data.npz'
 
-    # Save to .npz (NumPy compressed archive)
-    # Contains three arrays: v5 (N, D), v7 (N, D), var_names (D,)
-    outpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.output)
-    np.savez(
-        outpath,
-        v5=v5, v7=v7,
-        var_names=np.array(var_names),
-    )
-    print(f"Saved to {outpath}: v5 {v5.shape}, v7 {v7.shape}, {len(var_names)} variables")
+        v5, v7, var_names, metadata = generate_paired_cohort(
+            n_patients=n_patients, seed=args.seed, n_workers=args.n_workers,
+        )
 
-    # Print summary statistics for the first 10 variables to verify
-    # reasonable distributions (spot-check for calibration errors).
-    print(f"\n{'='*60}")
-    print(f"  Cohort Summary ({v5.shape[0]} patients, {v5.shape[1]} variables)")
-    print(f"{'='*60}")
-    for i, name in enumerate(var_names[:10]):
-        print(f"  {name:30s}  V5: {v5[:,i].mean():.2f} +/- {v5[:,i].std():.2f}  "
-              f"V7: {v7[:,i].mean():.2f} +/- {v7[:,i].std():.2f}")
-    print(f"  ... and {len(var_names) - 10} more variables")
+        outpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), output)
+        np.savez(outpath, v5=v5, v7=v7, var_names=np.array(var_names))
+        print(f"Saved to {outpath}: v5 {v5.shape}, v7 {v7.shape}, {len(var_names)} variables")
+
+        print(f"\n{'='*60}")
+        print(f"  Cohort Summary ({v5.shape[0]} patients, {v5.shape[1]} variables)")
+        print(f"{'='*60}")
+        for i, name in enumerate(var_names[:10]):
+            print(f"  {name:30s}  V5: {v5[:,i].mean():.2f} +/- {v5[:,i].std():.2f}  "
+                  f"V7: {v7[:,i].mean():.2f} +/- {v7[:,i].std():.2f}")
+        print(f"  ... and {len(var_names) - 10} more variables")
+
+    else:  # monthly
+        n_patients = args.n_patients or 5000
+        output = args.output or 'cohort_monthly.npz'
+
+        generate_monthly_cohort(
+            n_patients=n_patients, n_months=args.n_months,
+            n_workers=args.n_workers, seed=args.seed,
+            validate=args.validate, output_path=output,
+        )
 
 
 if __name__ == '__main__':
