@@ -170,16 +170,17 @@ TUNABLE_PARAMS = {
     # leading to higher filling pressures (LVEDP, E/e') at the same volume.
     #
     # Range justification:
-    # - Lower bound 1.0: normal stiffness (no softening modeled).
-    # - Upper bound 3.0: 3x normal stiffness (severe HFpEF). Beyond this,
-    #   the LV cannot fill adequately and CO drops precipitously.
+    # - Lower bound 0.5: below-normal stiffness (more compliant ventricle).
+    # - Upper bound 4.0: 4x normal stiffness (severe HFpEF). At 4.0,
+    #   EF drops to ~49%, CO to ~2.9 L/min — extreme but stable.
     # - Default 1.0: normal diastolic compliance.
+    # - Internal clamp in apply_stiffness() clips to [0.5, 4.0].
     #
     # This parameter is INDEPENDENT of diabetes_scale's passive_k1_factor.
     # The total stiffness multiplier is k1_scale * passive_k1_factor,
     # so both diabetes and direct fibrosis can increase stiffness.
     'k1_scale': {
-        'range': (1.0, 3.0), 'default': 1.0,
+        'range': (0.5, 4.0), 'default': 1.0,
         'desc': 'Passive myocardial stiffness scale (HFpEF: >1 increases diastolic '
                 'dysfunction). Maps to Patch[k1] on LV/SV in CircAdapt.',
     },
