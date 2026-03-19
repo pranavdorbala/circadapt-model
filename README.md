@@ -25,7 +25,7 @@ Heart failure with preserved ejection fraction (HFpEF) presents a fundamental mo
 .
 ├── cardiorenal_coupling.py    # Core coupled heart-kidney simulation engine
 ├── emission_functions.py      # 113 ARIC clinical variable extraction layer
-├── synthetic_cohort.py        # Synthetic V5→V7 paired cohort generator
+├── synthetic_cohort.py        # Synthetic cohort generator (paired V5→V7 + monthly trajectories)
 ├── train_nn.py                # Residual neural network (V5→V7 prediction)
 ├── agent_loop.py              # Agentic LLM inference engine
 ├── agent_tools.py             # LLM-callable tools (run model, compute error, etc.)
@@ -51,7 +51,7 @@ Heart failure with preserved ejection fraction (HFpEF) presents a fundamental mo
 |------|--------------|-------------|
 | `cardiorenal_coupling.py` | 3.1-3.4 | CircAdapt heart model wrapper, Hallow renal model, inflammatory mediator layer, bidirectional message passing (Algorithm 1) |
 | `emission_functions.py` | 3.6 | Maps CircAdapt waveforms + Hallow outputs to 113 ARIC echocardiographic and renal variables |
-| `synthetic_cohort.py` | 3.7 | Generates synthetic patient cohorts with correlated disease progression over 6 years |
+| `synthetic_cohort.py` | 3.7 | Generates synthetic cohorts: paired V5/V7 for NN training + monthly trajectories for RL |
 | `train_nn.py` | 3.8 | Residual MLP: X_7 = W_skip * X_5 + g_phi(X_5), with composite loss (Eq. 14) |
 | `agent_loop.py` | 3.9 | LLM-based agentic optimizer with tool-calling loop and Nelder-Mead fallback |
 | `agent_tools.py` | 3.9 | Four LLM tools: `run_circadapt_model`, `compute_error`, `get_sensitivity`, `compare_to_clinical_norms` |
@@ -156,11 +156,14 @@ print(f"LVEF: {variables['LVEF_pct']:.1f}%, GFR: {variables['GFR_mL_min']:.1f} m
 Generate paired V5/V7 ARIC variable vectors for training:
 
 ```bash
-# Generate 10,000 synthetic patients (parallelized, ~2 hours on 8 cores)
-python synthetic_cohort.py --n_patients 10000 --n_workers 8 --seed 42
+# Generate paired V5/V7 cohort (10,000 patients, ~2 hours on 8 cores)
+python synthetic_cohort.py --mode paired --n_patients 10000 --n_workers 8 --seed 42
+
+# Generate monthly trajectories (5,000 patients, 96 months)
+python synthetic_cohort.py --mode monthly --n_patients 5000 --n_workers 8
 
 # Quick test with 100 patients
-python synthetic_cohort.py --n_patients 100 --n_workers 1
+python synthetic_cohort.py --mode paired --n_patients 100 --n_workers 1
 ```
 
 **Output:** `cohort_data.npz` containing:
