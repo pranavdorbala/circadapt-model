@@ -39,7 +39,7 @@ from typing import Dict, Tuple, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sim_logging import sim_logger
+from sim_logging import sim_logger, extract_key_outputs
 from config import (
     TUNABLE_PARAMS, NUMERIC_VAR_NAMES, NON_NUMERIC_VARS, COHORT_DEFAULTS,
     CORE_20_VARIABLES, MEASUREMENT_NOISE, CYSTATIN_C_PARAMS, PASP_MISSING_PARAMS,
@@ -262,11 +262,7 @@ def evaluate_patient_state(
 
         sim_logger.log_run(
             params=params,
-            outputs={'EF': hemo['EF'], 'MAP': hemo['MAP'], 'CO': hemo['CO'],
-                     'SV': hemo['SV'], 'GFR': renal_state['GFR'],
-                     'V_blood': renal_state['V_blood'],
-                     'Na_excr': renal_state.get('Na_excretion', params.get('na_intake', 150.0)),
-                     'P_glom': renal_state['P_glom']},
+            outputs=extract_key_outputs(hemo, renal_state),
             success=True,
             source='evaluate_patient_state',
             demographics=demographics,

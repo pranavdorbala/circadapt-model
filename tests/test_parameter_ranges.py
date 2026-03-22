@@ -245,13 +245,13 @@ class TestK1Scale:
     """
 
     def test_boundary_min_no_crash(self):
-        """k1_scale=1.0 (documented min, normal stiffness)."""
-        hemo = _run_heart(k1_scale=1.0)
+        """k1_scale=0.5 (documented min)."""
+        hemo = _run_heart(k1_scale=0.5)
         assert np.isfinite(hemo['EF'])
 
     def test_boundary_max_no_crash(self):
-        """k1_scale=3.0 (documented max)."""
-        hemo = _run_heart(k1_scale=3.0)
+        """k1_scale=4.0 (documented max)."""
+        hemo = _run_heart(k1_scale=4.0)
         assert np.isfinite(hemo['EF'])
 
     def test_internal_clamp_at_4(self):
@@ -467,16 +467,6 @@ class TestNaIntake:
         Over multiple coupling steps, high na_intake should raise blood
         volume (Na retention → fluid retention).
         """
-        old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        try:
-            hist_low = run_coupled_simulation(n_steps=4)
-            # Reset and run with modified na_intake
-            # NOTE: na_intake is not directly a schedule parameter in
-            # run_coupled_simulation, so we test it via the renal model directly.
-        finally:
-            sys.stdout = old_stdout
-
         renal_low = HallowRenalModel()
         renal_low.Na_intake = 50.0
         renal_high = HallowRenalModel()

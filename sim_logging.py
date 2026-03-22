@@ -9,6 +9,7 @@ outputs, and success/failure labels at each coupling step.
 import json
 import time
 import os
+import warnings
 from typing import Dict, Optional, Any
 
 
@@ -65,6 +66,22 @@ KEY_OUTPUTS = {
 }
 
 
+def extract_key_outputs(hemo, renal):
+    """Build the 8-key outputs dict from hemodynamics + renal state.
+
+    Parameters
+    ----------
+    hemo : dict  — hemodynamics dict with keys EF, MAP, CO, SV
+    renal : HallowRenalModel or dict — renal state (attribute or key access)
+    """
+    def _get(obj, key):
+        return obj[key] if isinstance(obj, dict) else getattr(obj, key)
+    return {
+        'EF': hemo['EF'], 'MAP': hemo['MAP'], 'CO': hemo['CO'], 'SV': hemo['SV'],
+        'GFR': _get(renal, 'GFR'), 'V_blood': _get(renal, 'V_blood'),
+        'Na_excr': _get(renal, 'Na_excretion'), 'P_glom': _get(renal, 'P_glom'),
+    }
+
 
 # ─── Structured simulation log (JSON lines) ──────────────────────────────────
 
@@ -87,6 +104,7 @@ class SimulationLogger:
         self.log_dir = os.path.join(os.path.dirname(__file__), log_dir)
         self.log_path = os.path.join(self.log_dir, filename)
         self._ensured = False
+        self._warned_write_failure = False
 
     def _ensure_dir(self):
         if not self._ensured:
@@ -152,11 +170,17 @@ class SimulationLogger:
         if duration_s is not None:
             entry['duration_s'] = round(duration_s, 3)
 
+        # NOTE: Multiple processes may write to this file concurrently
+        # (e.g., multiprocessing.Pool in synthetic_cohort.py). Each JSON line
+        # is well under PIPE_BUF (4096 bytes), so POSIX O_APPEND writes are
+        # atomic and lines will not interleave.
         try:
             with open(self.log_path, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
-        except OSError:
-            pass  # Never let logging failure crash a simulation
+        except OSError as e:
+            if not self._warned_write_failure:
+                warnings.warn(f"SimulationLogger: failed to write to {self.log_path}: {e}")
+                self._warned_write_failure = True
 
 
 # Module-level default instance
