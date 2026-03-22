@@ -1,0 +1,20 @@
+{
+  "is_real_circadapt": true,
+  "values": {
+    "MAP": 86.35643589778232,
+    "SBP": 118.91627256912201,
+    "DBP": 70.07651756211247,
+    "CO": 5.100258227039452,
+    "EF": 60.081880181084934,
+    "EDV": 120.25865035951263
+  },
+  "in_range": {
+    "MAP": true,
+    "SBP": true,
+    "DBP": true,
+    "CO": true,
+    "EF": true,
+    "EDV": true
+  },
+  "all_pass": true
+}

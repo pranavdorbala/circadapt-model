@@ -1,0 +1,25 @@
+{
+  "fits": {
+    "EF": {
+      "bilinear_R2": null,
+      "biquadratic_R2": null
+    },
+    "MAP": {
+      "bilinear_R2": null,
+      "biquadratic_R2": null
+    },
+    "CO": {
+      "bilinear_R2": null,
+      "biquadratic_R2": null
+    },
+    "LVEDP": {
+      "bilinear_R2": 1.0,
+      "biquadratic_R2": 1.0
+    },
+    "Pven": {
+      "bilinear_R2": null,
+      "biquadratic_R2": null
+    }
+  },
+  "analytical_heart_feasible": false
+}
