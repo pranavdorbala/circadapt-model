@@ -91,12 +91,12 @@ class CircAdaptHeartModel:
     of the paper. It interfaces between the coupling protocol (Algorithm 1)
     and the underlying CircAdapt finite-element cardiac mechanics solver.
 
-    Key operations map to Algorithm 1 steps:
-      - apply_deterioration()        -> Step 3: scale contractility (Sf_act)
-      - apply_stiffness()            -> Step 2: scale diastolic stiffness (k1)
-      - apply_inflammatory_modifiers() -> Step 1: apply mediator effects
-      - apply_kidney_feedback()      -> Step 8: set V_blood and SVR from kidney
-      - run_to_steady_state()        -> Step 4: run(stable=True), extract hemodynamics
+    Key operations map to Algorithm 1 (Coupled Cardiorenal Simulation):
+      - apply_deterioration()          -> Apply disease: scales Sf_act (contractility)
+      - apply_stiffness()              -> Apply disease: scales k1 (passive diastolic stiffness)
+      - apply_inflammatory_modifiers() -> Apply inflammatory modifiers: adjusts ArtVen p0 (SVR), Tube0D k (arterial stiffness), k1
+      - apply_kidney_feedback()        -> Kidney to Heart: sets V_blood and resistance ratio R_r from renal model
+      - run_to_steady_state()          -> CircAdapt solver: runs multiple cardiac cycles until stable, extracts MAP, CO, CVP, EF, SV
 
     Section 3.1 describes how CircAdapt parameters map to pathophysiology:
       - Sf_act (active fiber stress) controls systolic contractility

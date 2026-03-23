@@ -33,6 +33,23 @@ Two models are initialized to a healthy baseline state:
 
 Both models start healthy. Disease is applied during the simulation loop (Step 4 onward).
 
+### CircAdapt Wrapper — Code-to-Algorithm Mapping
+
+The `CircAdaptWrapper` class in `cardiorenal_coupling.py` wraps the CircAdapt VanOsta2024 solver and exposes five operations that map directly to Algorithm 1:
+
+| Code method | Algorithm 1 step | What it does |
+|---|---|---|
+| `apply_deterioration(Sf_act_scale)` | Apply disease | Scales **Sf_act** (active fiber stress) — controls how hard the heart can squeeze. Lower values = weaker contraction = heart failure. |
+| `apply_stiffness(k1_scale)` | Apply disease | Scales **k1** (passive myocardial stiffness) — controls how stiff the heart wall is at rest. Higher values = stiffer wall = diastolic dysfunction (HFpEF). |
+| `apply_inflammatory_modifiers(infl, diab)` | Apply inflammatory modifiers | Modifies internal CircAdapt variables based on inflammation and diabetes burden: |
+| | | — **ArtVen p0**: peripheral vascular resistance set-point. Inflammation raises p0 → arteries constrict → higher blood pressure (hypertension). |
+| | | — **Tube0D k**: arterial wall stiffness. Inflammation raises k → stiffer arteries → higher pulse wave velocity → higher systolic pressure (arteriosclerosis). |
+| | | — Also further increases **k1** (passive stiffness) via diabetes burden. |
+| `apply_kidney_feedback(V_b, R_r)` | Kidney → Heart | Receives the kidney's messages: sets blood volume (V_b) and vascular resistance ratio (R_r) in CircAdapt. This is how kidney damage reaches the heart — fluid overload and increased resistance. |
+| `run_to_steady_state()` | CircAdapt solver | Runs CircAdapt for multiple cardiac cycles until pressures and volumes converge beat-to-beat. Extracts hemodynamics (MAP, CO, CVP, EF, SV) from the final stable beat. |
+
+**Key distinction**: `Sf_act_scale` and `k1_scale` are direct disease knobs you set explicitly. ArtVen p0 and Tube0D k are internal variables that get modified automatically as downstream effects of `inflammation_scale` and `diabetes_scale`.
+
 ## Step 3 — Pre-equilibration
 
 Before the main simulation loop begins, the kidney's tubuloglomerular feedback (TGF) setpoint is stabilized by running 5 renal updates at baseline conditions.
