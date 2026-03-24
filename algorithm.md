@@ -17,7 +17,15 @@ The algorithm takes three inputs:
   | `inflammation_scale` | Both | Systemic inflammatory burden (0 = none, 1 = severe) |
   | `diabetes_scale` | Both | Diabetes burden (0 = none, 1 = severe) |
 
-  A healthy patient has all scales at 1.0 and inflammation/diabetes at 0.0. A sick patient might have `Sf_act_scale=0.7` (weak heart), `Kf_scale=0.6` (damaged kidneys), `inflammation_scale=0.5`.
+  A healthy patient has all scales at 1.0 and inflammation/diabetes at 0.0. A sick patient might have `Sf_act_scale=0.7` (weak heart), `Kf_scale=0.6` (damaged kidneys), `inflammation_scale=0.5`. The first 6 parameters directly set how sick each organ is, while `inflammation_scale` and `diabetes_scale` are amplifiers — they don't create new damage pathways, they make the existing 6 parameters' effects worse across both organs simultaneously (via Table 1/Table 5 modifiers).
+
+- **Inflammatory mediator layer (our contribution)**: CircAdapt and Hallow are existing, validated simulators built by other groups — CircAdapt (Van Osta et al. 2024) simulates a heart, Hallow (Hallow et al. 2017) simulates a kidney. Neither knows anything about inflammation, diabetes, or the other organ. The inflammatory mediator layer, the bidirectional coupling protocol (Algorithm 1), and the translation of `inflammation_scale`/`diabetes_scale` into parameter modifications for both simulators are **our additions** — the novel contribution that connects two independent organ models into a coupled cardiorenal system with shared metabolic disease drivers. The coefficients (e.g., 25% contractility loss from inflammation, 40% k1 increase from diabetes) are derived from published clinical studies (Table 5), and the RL agent learns residual corrections on top of them from ARIC data. In code, this lives in `compute_inflammatory_state()` (~line 830) and `apply_inflammatory_modifiers()` (~line 299) in `cardiorenal_coupling.py`. For example, the contractility modifier:
+  ```python
+  infl_Sf = 1.0 - 0.25 * infl     # Up to 25% contractility reduction from inflammation
+  diab_Sf = 1.0 - 0.20 * diab     # Up to 20% contractility reduction from diabetes
+  state.Sf_act_factor = infl_Sf * diab_Sf  # Multiplicative: independent mechanisms
+  ```
+  This factor then gets multiplied with `Sf_act_scale` in the simulation loop — so if a patient has `Sf_act_scale=0.7`, `inflammation=0.4`, `diabetes=0.3`, the effective contractility is `0.7 × 0.90 × 0.94 = 0.59` (heart at 59% strength).
 
 - **Coupling α**: Controls how aggressively the two organs influence each other. At α=1, the full signal passes between heart and kidney. At α=0.5, only half the change passes through. This prevents oscillation — without dampening, the heart and kidney could ping-pong (heart raises MAP → kidney retains fluid → heart raises MAP more → diverges). In the RL version, α becomes 5 learned values that change at each time step.
 
@@ -29,7 +37,7 @@ Two models are initialized to a healthy baseline state:
 
 - **CircAdapt heart model (H)**: Loads the VanOsta2024 cardiac simulator with a reference pressure waveform (`P_ref_VanOsta2024.npy`). This represents a healthy heart with normal chamber sizes, normal contractility, and normal pressures. No disease has been applied yet.
 
-- **Hallow renal state (r_0)**: Creates a renal state with healthy baseline values — GFR = 100 mL/min, blood volume = 5000 mL, normal glomerular pressure, normal sodium excretion. This is a healthy kidney before any disease.
+- **Hallow renal state (r_0)**: Creates a renal state with healthy baseline values — GFR = 120 mL/min, blood volume = 5000 mL, normal glomerular pressure, normal sodium excretion. This is a healthy kidney before any disease. In the code, these are the default field values in the `HallowRenalModel` dataclass (`cardiorenal_coupling.py`, ~line 568) — all initialization, no computation.
 
 Both models start healthy. Disease is applied during the simulation loop (Step 4 onward).
 

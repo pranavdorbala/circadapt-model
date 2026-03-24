@@ -593,7 +593,6 @@ class HallowRenalModel:
     # N_nephrons: total nephron count per kidney. Humans have ~1 million
     # per kidney; total GFR = 2 * N * SNGFR (Eq. 7, factor of 2 for two kidneys).
     N_nephrons: float = 1.0e6        # nephrons per kidney
-
     # Kf: single-nephron ultrafiltration coefficient. Determines the
     # proportionality between net filtration pressure and SNGFR in the
     # Starling equation (Eq. 6). Calibrated to produce baseline GFR ~120 mL/min

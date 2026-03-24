@@ -91,3 +91,176 @@ passive_k1_factor = 1 + 0.40×0.5 = 1.20
 effective_k1 = 1.5 × 1.20 = 1.80
 → Heart wall 80% stiffer than normal → elevated filling pressures (diastolic dysfunction)
 ```
+
+---
+
+## 2. Vascular Resistance (p0) — Multiplicative Composition
+
+> **KEY FINDING FOR PAPER:** The multiplicative composition of vascular resistance modifiers is not an arbitrary implementation choice — it is the standard convention in cardiovascular physiology modeling, grounded in Poiseuille's law and used by Guyton (1972), HumMod, and Hallow et al. (2017). This should be explicitly stated and justified in the paper.
+
+### What p0 is
+
+In CircAdapt, there is no direct "SVR knob." Vascular resistance is controlled indirectly through `p0`, the pressure set-point in the ArtVen element. CircAdapt's pressure-flow relationship (Appendix B.3.2, Eq. 22):
+
+```
+q = sign(Δp) · q0 · (|Δp| / p0)^k
+```
+
+Raising p0 means more pressure is needed to drive the same flow — equivalent to increasing vascular resistance.
+
+### What modifies p0
+
+Two independent mechanisms modify p0 simultaneously:
+
+| Source | What it represents | Paper reference |
+|---|---|---|
+| `SVR_ratio` | Kidney → Heart message: RAAS activation + nephron loss increase resistance | Eq. 27: `SVR_t = RAAS_t · (1 + 0.4(1 - K_f^scale))`, dampened by α (Eq. 5) |
+| `_pathology_p0_factor` | Diabetes/inflammation: endothelial dysfunction + microvascular rarefaction | Eq. 43: `p0_eff = p0^(0) · (1 + φ4 · d)`, φ4 = 0.10; plus inflammation via `p0_factor = (1 + 0.15·infl) · (1 + 0.10·diab)` |
+
+### How they combine in code
+
+```python
+# cardiorenal_coupling.py, apply_kidney_feedback(), ~line 283
+self.model['ArtVen']['p0']['CiSy'] = (
+    self._ref_ArtVen_p0 * SVR_ratio * self._pathology_p0_factor
+)
+```
+
+The paper describes each factor separately (Eq. 27, Eq. 43) but does not explicitly write out the combined product. The multiplicative composition is an implementation choice.
+
+### Why multiplicative is correct — literature justification
+
+**Poiseuille's Law** provides the physical basis: `R = 8ηL / (πr⁴)`. Different mechanisms affect different physical quantities:
+- **RAAS** contracts smooth muscle → changes arteriolar radius `r`
+- **Inflammation** increases endothelial dysfunction / viscosity → changes `η`
+- **Diabetes** reduces capillary density (microvascular rarefaction) → changes effective `L`
+
+Since these act on independent physical parameters, their effects on resistance compose multiplicatively.
+
+**Guyton / HumMod models** (the gold standard for cardiovascular simulation) use this exact product-of-multipliers approach:
+```
+TPR = R_base × M_autoregulation × M_angiotensin × M_sympathetic × M_viscosity × ...
+```
+Each modifier is a dimensionless multiplier (1.0 = baseline). This has been the convention since Guyton 1972 and is used in all major descendants (HumMod, CellML reimplementations).
+
+**Hallow et al. 2017** (the kidney model in this framework) also uses multiplicative composition for neurohormonal modulation of resistance segments — RAAS modulates arteriole diameters through logistic saturation functions, and resistance follows Poiseuille's law (R ~ 1/d⁴).
+
+**Key references:**
+- Guyton AC, Coleman TG, Granger HJ. "Circulation: overall regulation." *Annual Review of Physiology*, 1972.
+- Hester RL et al. "HumMod: an integrative model of integrative human physiology." *Frontiers in Physiology*, 2011.
+- Hallow KM et al. "Cardiorenal modeling of blood pressure and kidney function." *CPT: Pharmacometrics & Systems Pharmacology*, 2017.
+
+### Why this matters
+
+Additive composition (`p0_ref × (1 + (SVR_ratio - 1) + (p0_factor - 1))`) would underestimate the combined effect in severe disease. At small perturbations the difference is negligible, but at large perturbations (severe CKD + diabetes), multiplicative compounding produces qualitatively different long-horizon trajectories — exactly the regime where accurate coupling matters most for forecasting.
+
+### Note on p0 as SVR proxy
+
+Scaling p0 linearly does not produce a perfectly linear SVR change because of the exponent `k` in Eq. 22 (`SVR ∝ p0^k`, not `p0`). If `k ≠ 1`, the relationship is nonlinear. However, after p0 is set, CircAdapt runs to steady state and re-equilibrates all pressures and flows. The final SVR is determined by the full hemodynamic equilibrium, not just p0 alone. The p0 scaling is a directional nudge; CircAdapt's solver finds the correct equilibrium.
+
+---
+
+## 3. Run to Steady State — Three-Phase Hemodynamic Convergence
+
+After all parameters are set (disease knobs, inflammatory modifiers, kidney feedback), CircAdapt needs to find the new hemodynamic equilibrium. This is done in three phases inside `run_to_steady_state()` (`cardiorenal_coupling.py`, ~line 356).
+
+### Why three phases?
+
+When the kidney model updates blood volume (e.g., from 5.0L to 5.2L due to sodium retention), CircAdapt can't just instantly accept that — the extra 200mL needs to be distributed across all vascular compartments (arteries, veins, heart chambers), and the heart needs to adapt to the new loading conditions over multiple beats.
+
+### Phase 1 — PFC ON: Volume redistribution
+
+```python
+self.model['PFC']['is_active'] = True
+self.model.run(stable=True)
+```
+
+PFC (Peripheral Flow Control) is CircAdapt's built-in mechanism for distributing blood volume across the circulation. With PFC enabled, CircAdapt actively moves fluid between compartments until the target volume (set by `apply_kidney_feedback`) is achieved. The solver runs beat after beat until pressures and volumes converge.
+
+**Analogy:** Pouring water into a system of connected vessels — PFC ensures the water reaches every compartment in the right proportions.
+
+### Phase 2 — PFC OFF: Free equilibration
+
+```python
+self.reset_volume_control()   # PFC off
+self.model.run(stable=True)
+```
+
+Now PFC is turned off and the circulation runs again to stability. Why? With PFC on, it was *actively forcing* volume distribution — like holding a ball underwater. Turning it off lets the circulation settle naturally under its own pressure-flow dynamics. This gives the true hemodynamic equilibrium: the pressures, flows, and volumes that would actually exist with the new blood volume and disease parameters.
+
+**Why this matters:** If we read measurements while PFC is still active, we'd get artificially clamped values, not the natural equilibrium. The heart needs to settle without external forcing.
+
+### Phase 3 — Clean beat extraction
+
+```python
+self.model['Solver']['store_beats'] = 1
+self.model.run(1)
+```
+
+Run one final cardiac cycle and store only that beat's waveforms. All the transient settling beats from phases 1 and 2 are discarded. This clean beat is what we extract measurements from (MAP, CO, EF, SV, full PV-loop waveforms for the emission functions).
+
+### Error handling
+
+Each phase is wrapped in try/except because extreme disease parameters (e.g., `Sf_act_scale=0.2` with severe volume overload) can crash the CircAdapt solver. The fallback strategy is:
+1. Try `run(stable=True)` — let CircAdapt decide when it's converged
+2. If that fails, try `run(n_settle)` — run a fixed number of beats (default 5)
+3. If that also fails, continue with the last valid state — partial results are better than crashing the entire simulation
+
+This defensive approach is essential for synthetic cohort generation, where thousands of random parameter combinations are tested and some will inevitably push the solver to its limits.
+
+---
+
+## 4. Inflammatory Mediator Layer (Our Contribution)
+
+CircAdapt (Van Osta et al. 2024) and Hallow (Hallow et al. 2017) are existing, validated simulators built by other groups. CircAdapt simulates a heart. Hallow simulates a kidney. Neither knows anything about inflammation, diabetes, or the other organ.
+
+The inflammatory mediator layer, the bidirectional coupling protocol (Algorithm 1), and the translation of `inflammation_scale`/`diabetes_scale` into parameter modifications for both simulators are **our additions** — the novel contribution that connects two independent organ models into a coupled cardiorenal system with shared metabolic disease drivers.
+
+In code, this lives in `compute_inflammatory_state()` (~line 830) and `apply_inflammatory_modifiers()` (~line 299) in `cardiorenal_coupling.py`.
+
+### How it works
+
+The inflammatory layer takes two inputs — `inflammation_scale` ∈ [0,1] and `diabetes_scale` ∈ [0,1] — and computes modifier factors for parameters in both organs. For example:
+
+```python
+infl_Sf = 1.0 - 0.25 * infl     # Up to 25% contractility reduction from inflammation
+diab_Sf = 1.0 - 0.20 * diab     # Up to 20% contractility reduction from diabetes
+state.Sf_act_factor = infl_Sf * diab_Sf  # Multiplicative: independent mechanisms
+```
+
+This factor then gets multiplied with `Sf_act_scale` in the simulation loop — so if a patient has `Sf_act_scale=0.7`, `inflammation=0.4`, `diabetes=0.3`, the effective contractility is `0.7 × 0.90 × 0.94 = 0.59` (heart at 59% strength).
+
+The coefficients (0.25, 0.20, 0.40, etc.) are approximate magnitudes from published clinical studies (Table 5 in the paper). The RL agent learns residual corrections (Δφ_j) on top of them from ARIC data.
+
+### Parameters affected by the inflammatory layer
+
+| Modifier | Formula | What it does | Affected by | Source |
+|---|---|---|---|---|
+| `Sf_act_factor` | `(1 - 0.25·infl) × (1 - 0.20·diab)` | Reduces heart contractility | Inflammation + Diabetes | Feldman 2000, Bugger 2014 |
+| `passive_k1_factor` | `1 + 0.40·diab` | Increases heart wall stiffness | Diabetes only | van Heerebeek 2008 |
+| `stiffness_factor` | `(1 + 0.30·infl) × (1 + 0.50·diab)` | Increases arterial stiffness (Tube0D k) | Inflammation + Diabetes | Vlachopoulos 2005, Prenner 2015 |
+| `p0_factor` | `(1 + 0.15·infl) × (1 + 0.10·diab)` | Increases vascular resistance (SVR) | Inflammation + Diabetes | Endemann 2004 |
+| `Kf_factor` | `(1 - 0.15·infl) × biphasic_diabetes` | Reduces kidney filtration capacity | Inflammation + Diabetes | Brenner 1996 |
+| `EA_constriction_factor` | `1 + 0.25·diab` | Constricts efferent arteriole | Diabetes only | Brenner 1996 |
+| `eta_PT_offset` | `0.04·infl + 0.06·diab` | Increases proximal tubule sodium reabsorption | Inflammation + Diabetes | Thomson 2004 |
+| `MAP_setpoint_offset` | `max(5·infl, 8·diab)` | Shifts kidney's MAP set-point upward | Inflammation or Diabetes (whichever is worse) | — |
+
+### Parameters NOT affected by the inflammatory layer
+
+| Parameter | Why not |
+|---|---|
+| `TGF_gain` | Patient-level autoregulation strength — varies between people, not a disease mechanism |
+| `na_intake` | Dietary sodium — purely behavioral (how much salt they eat) |
+| `RAAS_gain` | Patient-level hormonal sensitivity — set directly, not modified by inflammation |
+
+### How modifiers are applied (separation of concerns)
+
+Not all modifiers are applied in the same place. The architecture ensures single write paths:
+
+| Modifier | Applied where | Why |
+|---|---|---|
+| `stiffness_factor` | Directly in `apply_inflammatory_modifiers()` | Only source — no other factor modifies arterial stiffness |
+| `passive_k1_factor` | Stored, applied later in `apply_stiffness()` | Must compose with `k1_scale` (direct disease knob) |
+| `p0_factor` | Stored, applied later in `apply_kidney_feedback()` | Must compose with `SVR_ratio` (kidney feedback) |
+| `Sf_act_factor` | Applied in simulation loop before `apply_deterioration()` | Must compose with `Sf_act_scale` (direct disease knob) |
+| Renal modifiers | Applied inside `update_renal_model()` | Must compose with kidney-side disease parameters |
