@@ -264,3 +264,32 @@ Not all modifiers are applied in the same place. The architecture ensures single
 | `p0_factor` | Stored, applied later in `apply_kidney_feedback()` | Must compose with `SVR_ratio` (kidney feedback) |
 | `Sf_act_factor` | Applied in simulation loop before `apply_deterioration()` | Must compose with `Sf_act_scale` (direct disease knob) |
 | Renal modifiers | Applied inside `update_renal_model()` | Must compose with kidney-side disease parameters |
+
+### Simple vs Full ODE Inflammatory Model
+
+The codebase contains two versions of the inflammatory layer. The **simple version** (currently active) and a **full ODE version** (commented out, ~line 969–1085).
+
+**Simple version (active):** Stateless parametric scaling. Set `inflammation_scale=0.5`, instantly get `Sf_act_factor = 0.875`. No memory of how long the patient has been inflamed — same scale always produces the same modifiers.
+
+**Full ODE version (commented out):** Models inflammation as a dynamic state variable evolving via `dI/dt` with explicit sources and sinks:
+
+| Sources (create inflammation) | Mechanism |
+|---|---|
+| Uremic toxins | Kidney failure → toxin buildup → inflammation |
+| Cardiac congestion | Elevated CVP → gut edema → bacterial translocation → inflammation |
+| AGE-RAGE signaling | Diabetes → advanced glycation end-products → chronic inflammation |
+| Aldosterone | RAAS activation → mineralocorticoid-driven inflammation |
+
+| Sinks (clear inflammation) | Mechanism |
+|---|---|
+| Immune clearance | Body's natural resolution, modeled with a half-life |
+
+The ODE version also tracks **dynamic state variables** that accumulate over time:
+- Fibrosis (irreversible tissue scarring)
+- Endothelial dysfunction
+- AGE accumulation
+- Renal tubulointerstitial fibrosis
+
+**Why this matters:** In the ODE version, a patient inflamed for 5 years develops irreversible fibrosis, while a patient inflamed for 1 month does not — the simple version cannot distinguish these cases. The ODE version would also make the inflammatory layer **bidirectional**: kidney damage causes inflammation which worsens heart damage which worsens kidney damage, creating the cardiorenal syndrome vicious cycle as an emergent property rather than a prescribed input.
+
+**Why it's commented out:** The simple version is sufficient for the current paper. The ODE version is ready for future activation but adds parameters that would need calibration against longitudinal clinical data.
