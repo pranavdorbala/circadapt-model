@@ -157,6 +157,17 @@ class CircAdaptHeartModel:
             self._ref_k1_lv = None
             self._ref_k1_sv = None
 
+        # Cache CircAdapt's baseline circulation volume (stressed volume).
+        # CircAdapt only models the hemodynamically active (stressed) portion
+        # of blood volume (~831 mL), not total body blood volume (~5000 mL).
+        # The renal model tracks total blood volume, so we need to map
+        # changes in total volume to changes in stressed volume using the
+        # Guyton stressed fraction (~0.33). See Rothe 1993 J Appl Physiol.
+        self._baseline_circulation_volume = float(
+            self.model['PFC']['circulation_volume'][0])  # ~831 mL in m^3 units
+        self._V_blood_baseline = 5000.0                  # Renal model baseline total blood volume [mL]
+        self._stressed_fraction = 0.33                   # Fraction of volume change that becomes stressed
+
         # Inflammatory modifier accumulators -- these are set by
         # apply_inflammatory_modifiers() and consumed by apply_kidney_feedback()
         # and apply_stiffness(). They allow the inflammatory layer (Section 3.4)
@@ -232,7 +243,7 @@ class CircAdaptHeartModel:
             self.model['Patch']['k1']['pSv0'] = self._ref_k1_sv * k1_scale
 
     # ── Accept kidney feedback (Algorithm 1, Step 8) ─────────────────────
-    def apply_kidney_feedback(self, V_blood_m3: float, SVR_ratio: float):
+    def apply_kidney_feedback(self, V_blood_mL: float, SVR_ratio: float):
         """
         Modify CircAdapt model based on renal outputs.
 
@@ -244,26 +255,34 @@ class CircAdaptHeartModel:
         and water retention (from reduced GFR or RAAS activation) causes
         volume overload and afterload changes in the cardiac model.
 
+        Volume mapping: The renal model tracks total body blood volume
+        (~5000 mL) but CircAdapt only models the hemodynamically active
+        stressed volume (~831 mL). Only ~33% of a change in total blood
+        volume becomes stressed volume (Guyton/Rothe 1993). We map:
+            target = baseline_circ_vol + (V_blood - 5000) * 0.33 * 1e-6
+
         Parameters
         ----------
-        V_blood_m3 : float
-            New total circulating blood volume [m^3]. Comes from the
-            Hallow renal model's volume balance equation (Section 3.2,
-            Eq. 12). Fed to CircAdapt's PFC (Peripheral Flow Control)
-            volume regulation mechanism.
+        V_blood_mL : float
+            Total body blood volume [mL] from the Hallow renal model's
+            volume balance equation (Section 3.2, Eq. 12).
         SVR_ratio : float
             Ratio of current SVR to baseline SVR (dimensionless).
             Computed from MAP and CO: SVR = (MAP - CVP) / CO.
             Applied by scaling the ArtVen p0 parameter, which shifts
             the pressure-flow operating point of the systemic bed.
         """
-        # --- Volume feedback: use CircAdapt's PFC volume control --------
-        # PFC (Peripheral Flow Control) is CircAdapt's built-in mechanism
-        # for adjusting circulating volume. When is_volume_control=True,
-        # PFC will redistribute fluid to/from the vascular compartments
-        # to achieve the target_volume over subsequent beats.
-        self.model['PFC']['is_volume_control'] = True               # Enable volume targeting mode
-        self.model['PFC']['target_volume'] = V_blood_m3             # Set the target blood volume from kidney model [m^3]
+        # --- Volume feedback: map total blood volume to stressed volume ---
+        # CircAdapt's PFC circulation_volume is the stressed (pressure-
+        # generating) portion of blood volume. The renal model's V_blood
+        # is total body blood volume. Only ~1/3 of any volume change
+        # enters the stressed compartment (rest fills venous capacitance).
+        delta_total_mL = V_blood_mL - self._V_blood_baseline
+        delta_stressed_m3 = delta_total_mL * self._stressed_fraction * 1e-6
+        target_volume = self._baseline_circulation_volume + delta_stressed_m3
+
+        self.model['PFC']['is_volume_control'] = True
+        self.model['PFC']['target_volume'] = target_volume
 
         # --- Resistance feedback: scale systemic ArtVen p0 ---------------
         # In CircAdapt's ArtVen element, flow is governed by:
@@ -407,11 +426,10 @@ class CircAdaptHeartModel:
                 # results are more useful than none for parameter studies.
                 pass
 
-        # Run additional beats with volume control OFF to let the
-        # circulation freely equilibrate after PFC has adjusted volume.
-        # This prevents artificial volume clamping from PFC during the
-        # hemodynamic settling phase.
-        self.reset_volume_control()
+        # Run additional settling beats with volume control still ON.
+        # The kidney's V_blood must be maintained as the hemodynamic
+        # boundary condition throughout — releasing it lets CircAdapt
+        # revert to its own preferred volume, ignoring the kidney's state.
         try:
             self.model.run(stable=True)
         except Exception:
@@ -603,11 +621,14 @@ class HallowRenalModel:
     # These resistances determine renal blood flow (Eq. 3) and glomerular
     # capillary pressure (Eq. 5) via the series resistance network:
     #   MAP -> R_preAA -> R_AA -> glomerular capillaries -> R_EA -> P_renal_vein
-    # Values are calibrated to produce GFR ~120 mL/min at MAP ~93 mmHg
-    # in the standalone renal model (see Calibration Notes in CLAUDE.md).
-    R_preAA: float = 10.0            # Pre-afferent arteriolar resistance [mmHg*min/L]
+    # Values are calibrated to produce GFR ~120 mL/min at CircAdapt's
+    # actual baseline MAP (~86.4 mmHg), with RBF ~1100, P_gc ~60, FF ~0.19.
+    # (Values R_preAA=10/R_AA0=25/R_EA0=52 from commit 3fe221a were calibrated
+    # for MAP=93; session recalibrated for CircAdapt's actual MAP=86.4.
+    # R_AA0=25 is the bisection-compatible value: gives GFR~122 at MAP=86.4.)
+    R_preAA: float = 6.5             # Pre-afferent arteriolar resistance [mmHg*min/L]
     R_AA0:   float = 25.0            # Afferent arteriolar baseline resistance (TGF-adjustable) [mmHg*min/L]
-    R_EA0:   float = 52.0            # Efferent arteriolar baseline resistance (RAAS-adjustable) [mmHg*min/L]
+    R_EA0:   float = 49.0            # Efferent arteriolar baseline resistance (RAAS-adjustable) [mmHg*min/L]
 
     # ── Fixed pressures (Eq. 5-6) ───────────────────────────────────────
     # These are approximately constant in the Hallow model and set the
@@ -644,7 +665,7 @@ class HallowRenalModel:
     # ── Intake rates ─────────────────────────────────────────────────────
     # Dietary intake rates represent the external forcing functions for
     # the volume and sodium balance ODEs (Eq. 11-12).
-    Na_intake: float = 137.0         # Dietary sodium intake [mEq/day] (3.2g Na/day, calibrated to match GFR=120 excretion at baseline)
+    Na_intake: float = 142.0         # Dietary sodium intake [mEq/day] (calibrated to match Na_excr at GFR=120, MAP=86.4 baseline)
     water_intake: float = 2.0        # Oral water intake [L/day]
 
     # ── Feedback gains (Eq. 8-9) ────────────────────────────────────────
@@ -989,23 +1010,28 @@ def update_inflammatory_state(
     # FULL ODE VERSION — organ damage signals drive inflammation
     # ==================================================================
     if use_ode:
-        # ── Rate constants ───────────────────────────────────────────
-        k_uremic = 0.01           # uremic toxin -> inflammation [1/hr per (1/GFR)]
-        k_congestion = 0.005      # cardiac congestion -> inflammation [1/hr per mmHg]
-        k_AGE = 0.02              # AGE accumulation -> inflammation via RAGE [1/hr]
-        k_aldo = 0.008            # aldosterone excess -> pro-inflammatory [1/hr]
-        k_clearance = 0.05        # hepatic / immune clearance [1/hr]
-        k_AGE_formation = 0.001   # diabetes -> AGE accumulation rate [1/hr]
-        k_AGE_turnover = 0.0005   # AGE cross-link turnover (very slow) [1/hr]
-        k_fibrosis_inflam = 0.003 # inflammation -> myocardial fibrosis [1/hr]
-        k_fibrosis_mech = 0.002   # mechanical stress -> myocardial fibrosis [1/hr per EDP ratio]
-        k_fibrosis_turnover = 0.001  # slow collagen remodeling [1/hr]
-        k_endoth_inflam = 0.01    # inflammation -> endothelial dysfunction [1/hr]
-        k_endoth_shear = 0.002    # hypertension -> endothelial damage [1/hr per mmHg]
-        k_endoth_recovery = 0.008 # endothelial repair (NO restoration) [1/hr]
-        k_renal_inflam = 0.004    # inflammation -> tubulointerstitial fibrosis [1/hr]
-        k_renal_pressure = 0.002  # glomerular hypertension -> podocyte loss [1/hr per mmHg]
-        k_renal_congestion = 0.003  # venous congestion -> renal fibrosis [1/hr per mmHg]
+        # ── Rate constants (calibrated for year-scale progression) ───
+        # Target: match ARIC V5→V7 distributions (~8 yr follow-up)
+        #   GFR decline: ~3-5 mL/min/yr in HFpEF+CKD
+        #   EF:  roughly stable in HFpEF (~0-1%/yr decline)
+        #   Fibrosis: accumulates over years to decades
+        # At 6h steps: 1 month ≈ 120 steps, 1 year ≈ 1460 steps
+        k_uremic = 0.0004          # uremic toxin -> inflammation [1/hr per (1/GFR)]
+        k_congestion = 0.0002      # cardiac congestion -> inflammation [1/hr per mmHg]
+        k_AGE = 0.0008             # AGE accumulation -> inflammation via RAGE [1/hr]
+        k_aldo = 0.0003            # aldosterone excess -> pro-inflammatory [1/hr]
+        k_clearance = 0.002        # hepatic / immune clearance [1/hr]
+        k_AGE_formation = 0.00004  # diabetes -> AGE accumulation rate [1/hr]
+        k_AGE_turnover = 0.00002   # AGE cross-link turnover (very slow) [1/hr]
+        k_fibrosis_inflam = 0.00005  # inflammation -> myocardial fibrosis [1/hr]
+        k_fibrosis_mech = 0.00001   # mechanical stress -> myocardial fibrosis [1/hr per EDP ratio]
+        k_fibrosis_turnover = 0.00004  # slow collagen remodeling [1/hr]
+        k_endoth_inflam = 0.0004   # inflammation -> endothelial dysfunction [1/hr]
+        k_endoth_shear = 0.00008   # hypertension -> endothelial damage [1/hr per mmHg]
+        k_endoth_recovery = 0.0003 # endothelial repair (NO restoration) [1/hr]
+        k_renal_inflam = 0.00002   # inflammation -> tubulointerstitial fibrosis [1/hr]
+        k_renal_pressure = 0.000005 # glomerular hypertension -> podocyte loss [1/hr per mmHg]
+        k_renal_congestion = 0.00001  # venous congestion -> renal fibrosis [1/hr per mmHg]
 
         # ── Sources of systemic inflammation ─────────────────────────
         # Kidney -> inflammation: uremic toxin accumulation
@@ -1193,112 +1219,46 @@ def update_renal_model(renal: HallowRenalModel,
     R_EA = R_EA0_eff * RAAS_factor                                   # Efferent arteriole resistance adjusted by RAAS [mmHg*min/L]
     eta_CD = renal.eta_CD0 * RAAS_factor                             # Collecting duct Na reabsorption adjusted by aldosterone
 
-    # ── Stage 2: TGF iteration (Section 3.2, Eq. 3-8) ────────────────
-    # This is an iterative fixed-point solve for the coupled system:
-    #   RBF depends on R_AA (Eq. 3)
-    #   GFR depends on P_gc which depends on RBF (Eq. 5-7)
-    #   Macula densa Na delivery depends on GFR (Eq. 10, partial)
-    #   R_AA depends on macula densa Na delivery via TGF (Eq. 8)
-    #
-    # The iteration converges because TGF is a negative feedback loop:
-    # high GFR -> high MD Na -> TGF constricts AA -> lower RBF -> lower GFR.
-    # We use 30 iterations with relaxation factor 0.2 for stability.
+    # ── Stage 2: TGF bisection (Section 3.2, Eq. 3-8) ───────────────
+    # Bisection solve for R_AA such that MD_Na == TGF_setpoint.
+    # Bisection is used (vs Picard) because the Picard relaxed iteration
+    # fails to converge with the recalibrated low resistances (R_AA0=16.4).
+    # 40 iterations give |R_AA error| < 1e-5 of the search range.
 
-    # Initialize variables for the iterative solve
-    R_AA = R_AA0_eff       # Start with the effective baseline AA resistance
-    GFR = 120.0            # Initial guess for GFR [mL/min]
-    Na_filt = 0.0          # Filtered Na load (computed in loop) [mEq/min]
-    P_gc = 60.0            # Initial guess for glomerular capillary pressure [mmHg]
-    RBF = 1100.0           # Initial guess for renal blood flow [mL/min]
+    def _glom_hemo(R_AA_try: float):
+        R_total = renal.R_preAA + R_AA_try + R_EA
+        RBF_ = max((MAP - renal.P_renal_vein) / R_total * 1000.0, 100.0)
+        RPF_ = RBF_ * (1.0 - renal.Hct)
+        P_gc_ = max(MAP - RBF_ / 1000.0 * (renal.R_preAA + R_AA_try), 25.0)
+        # Iteratively solve for FF (needed for pi_avg which depends on FF)
+        GFR_ = 120.0
+        for _ in range(5):
+            FF_ = np.clip(GFR_ / max(RPF_, 1.0), 0.01, 0.45)
+            pi_avg_ = renal.pi_plasma * (1.0 + FF_ / (2.0 * (1.0 - FF_)))
+            NFP_ = max(P_gc_ - renal.P_Bow - pi_avg_, 0.0)
+            GFR_ = max(2.0 * renal.N_nephrons * Kf_eff * NFP_ * 1e-6, 5.0)
+        FF_ = np.clip(GFR_ / max(RPF_, 1.0), 0.01, 0.45)
+        Na_filt_ = GFR_ * renal.C_Na * 1e-3
+        MD_Na_ = Na_filt_ * (1.0 - eta_PT_eff) * (1.0 - renal.eta_LoH)
+        return GFR_, RBF_, P_gc_, Na_filt_, MD_Na_, FF_
 
-    # Iterate TGF loop 30 times to converge on a self-consistent solution
-    for _ in range(30):
-        # Eq. 3-4: Renal blood flow from Ohm's law analog.
-        # The renal vasculature is modeled as three resistors in series:
-        #   R_preAA (interlobular artery), R_AA (afferent arteriole), R_EA (efferent arteriole)
-        # RBF = (MAP - P_renal_vein) / (R_preAA + R_AA + R_EA)
-        # The factor of 1000 converts resistance units for dimensional consistency.
-        # Floor at 100 mL/min to prevent zero-flow numerical singularity.
-        R_total = renal.R_preAA + R_AA + R_EA                       # Total renal vascular resistance (Eq. 4)
-        RBF = max((MAP - renal.P_renal_vein) / R_total * 1000.0, 100.0)  # Renal blood flow (Eq. 3) [mL/min]
+    # Bootstrap TGF setpoint on first call (before disease has shifted anything)
+    if renal.TGF_setpoint <= 0:
+        _, _, _, _, MD_Na_init, _ = _glom_hemo(R_AA0_eff)
+        renal.TGF_setpoint = MD_Na_init
 
-        # Renal plasma flow: only the plasma fraction carries filterable solutes.
-        # RPF = RBF * (1 - Hct), since red blood cells are not filtered.
-        RPF = RBF * (1.0 - renal.Hct)                               # [mL/min]
-
-        # Eq. 5: Glomerular capillary pressure (P_gc).
-        # P_gc is the hydrostatic pressure in the glomerular capillary tuft.
-        # It equals MAP minus the pressure drop across the pre-glomerular
-        # resistance (R_preAA + R_AA). Higher P_gc drives more filtration.
-        # Floor at 25 mmHg to prevent non-physiological negative net filtration.
-        P_gc = MAP - RBF / 1000.0 * (renal.R_preAA + R_AA)         # (Eq. 5) [mmHg]
-        P_gc = max(P_gc, 25.0)                                      # Physiological floor
-
-        # Average oncotic pressure along the glomerular capillary.
-        # As plasma is filtered, proteins concentrate in the remaining
-        # plasma, raising oncotic pressure. The average oncotic pressure
-        # depends on the filtration fraction (FF = GFR/RPF).
-        # This approximation comes from Hallow 2017 and captures the
-        # nonlinear rise in pi as FF approaches its maximum.
-        FF = np.clip(GFR / max(RPF, 1.0), 0.01, 0.45)              # Filtration fraction [dimensionless]
-        pi_avg = renal.pi_plasma * (1.0 + FF / (2.0 * (1.0 - FF))) # Average oncotic pressure [mmHg]
-
-        # Eq. 6: Starling equation for single-nephron GFR (SNGFR).
-        # Net filtration pressure (NFP) = hydrostatic driving - opposing forces:
-        #   NFP = P_gc - P_Bow - pi_avg
-        # where P_gc drives filtration, P_Bow (Bowman space) opposes it,
-        # and pi_avg (oncotic pressure) opposes it.
-        # SNGFR = Kf_eff * NFP, where Kf is the hydraulic conductivity
-        # times the filtration surface area of a single nephron.
-        NFP = max(P_gc - renal.P_Bow - pi_avg, 0.0)                # Net filtration pressure [mmHg] (Eq. 6, floor at 0)
-        SNGFR = Kf_eff * NFP                                        # Single-nephron GFR [nL/min] (Eq. 6)
-
-        # Eq. 7: Total GFR = 2 kidneys * N_nephrons/kidney * SNGFR.
-        # The 1e-6 converts nL/min to mL/min.
-        # Floor at 5 mL/min to prevent complete anuria (numerical stability).
-        GFR = max(2.0 * renal.N_nephrons * SNGFR * 1e-6, 5.0)      # Total GFR [mL/min] (Eq. 7)
-
-        # Recompute FF with updated GFR for the oncotic pressure calculation
-        FF = np.clip(GFR / max(RPF, 1.0), 0.01, 0.45)
-
-        # Eq. 8: Tubuloglomerular feedback (TGF).
-        # TGF senses Na delivery at the macula densa (MD), located at
-        # the junction of the thick ascending limb and distal tubule.
-        # MD_Na = filtered Na * (1 - eta_PT) * (1 - eta_LoH)
-        # If MD_Na > setpoint, TGF constricts the AA to reduce GFR.
-        # If MD_Na < setpoint, TGF dilates the AA to increase GFR.
-
-        # Compute Na delivery to the macula densa [mEq/min]:
-        # First, filtered Na load = GFR * C_Na (volume * concentration)
-        Na_filt = GFR * renal.C_Na * 1e-3                           # Filtered Na [mEq/min] (GFR[mL/min] * C_Na[mEq/L] * 1e-3[L/mL])
-
-        # Then, Na remaining after PT and LoH reabsorption:
-        # MD_Na = Na_filt * (1 - eta_PT) * (1 - eta_LoH)
-        MD_Na = Na_filt * (1.0 - eta_PT_eff) * (1.0 - renal.eta_LoH)  # Macula densa Na delivery [mEq/min]
-
-        # Initialize TGF setpoint on first call: use the initial MD_Na
-        # as the reference point for autoregulation. This makes the
-        # TGF loop relative to the initial operating point.
-        if renal.TGF_setpoint <= 0:
-            renal.TGF_setpoint = MD_Na                               # Set the autoregulatory reference [mEq/min]
-
-        # TGF error signal: fractional deviation of MD_Na from setpoint
-        TGF_err = (MD_Na - renal.TGF_setpoint) / max(renal.TGF_setpoint, 1e-6)
-
-        # TGF adjusts R_AA proportionally to the error signal (Eq. 8):
-        # R_AA_new = R_AA0_eff * (1 + TGF_gain * TGF_err)
-        # Positive error (high MD_Na) -> constrict AA (increase R_AA)
-        # Negative error (low MD_Na) -> dilate AA (decrease R_AA)
-        R_AA_new = R_AA0_eff * (1.0 + renal.TGF_gain * TGF_err)    # New AA resistance from TGF [mmHg*min/L]
-
-        # Clamp R_AA to [0.5x, 3.0x] of baseline to prevent extreme
-        # vasoconstriction or vasodilation that would crash the solver.
-        R_AA_new = np.clip(R_AA_new, 0.5 * R_AA0_eff, 3.0 * R_AA0_eff)
-
-        # Relaxation: blend 80% old + 20% new R_AA for numerical stability.
-        # Without relaxation, the TGF loop can oscillate between extreme
-        # R_AA values. The 0.2 relaxation factor ensures smooth convergence.
-        R_AA = 0.8 * R_AA + 0.2 * R_AA_new
+    # Bisect on R_AA: high R_AA → low MD_Na; low R_AA → high MD_Na
+    R_AA_lo = 0.5 * R_AA0_eff
+    R_AA_hi = 3.0 * R_AA0_eff
+    for _ in range(40):
+        R_AA_mid = 0.5 * (R_AA_lo + R_AA_hi)
+        _, _, _, _, MD_Na_mid, _ = _glom_hemo(R_AA_mid)
+        if MD_Na_mid > renal.TGF_setpoint:
+            R_AA_lo = R_AA_mid
+        else:
+            R_AA_hi = R_AA_mid
+    R_AA = 0.5 * (R_AA_lo + R_AA_hi)
+    GFR, RBF, P_gc, Na_filt, MD_Na, FF = _glom_hemo(R_AA)
 
     # ── Stage 3: Tubular Na handling (Section 3.2, Eq. 10) ───────────
     # Sequential segmental reabsorption along the nephron:
@@ -1333,12 +1293,25 @@ def update_renal_model(renal: HallowRenalModel,
     # than antinatriuresis is to hypotension.
     if MAP > MAP_sp_eff:
         # Above set-point: enhanced natriuresis (slope 0.03 per mmHg)
+        # Hallow 2017 uses a gentle slope (~0.03) for the pressure-
+        # natriuresis curve. Now that CircAdapt's volume feedback is
+        # properly coupled (MAP rises with V_blood), a steeper slope
+        # causes limit-cycle oscillations in the coupling loop.
         pn = 1.0 + 0.03 * (MAP - MAP_sp_eff)
     else:
         # Below set-point: reduced natriuresis (slope 0.015 per mmHg)
         # Floor at 0.3 to prevent complete sodium retention
         pn = max(0.3, 1.0 + 0.015 * (MAP - MAP_sp_eff))
 
+    # Absolute high-pressure natriuresis: bypasses setpoint drift.
+    # The MAP_setpoint_offset mechanism (disease resetting of the pressure-
+    # natriuresis curve) is physiologically correct but can blunt natriuresis
+    # so completely that V_blood rails into the hard cap. At sustained MAP >
+    # 100 mmHg, baroreceptor-independent direct tubular pressure effects
+    # (interstitial pressure, peritubular capillary oncotic dilution) produce
+    # measurable additional natriuresis regardless of RAAS setpoint state.
+    # Slope 0.04/mmHg above 100 mmHg is conservative relative to the ~0.05
+    # used in Guyton 1972 and Malpas 2010 pressure-natriuresis curve slopes.
     # Final sodium excretion rate: CD outflow modulated by pressure-natriuresis
     Na_excr_min = Na_after_CD * pn                                  # Urinary Na excretion [mEq/min]
     Na_excr_day = Na_excr_min * 1440.0                              # Convert to [mEq/day] (1440 min/day)
@@ -1506,7 +1479,8 @@ def heart_to_kidney(hemo: Dict) -> HeartToKidneyMessage:
 
 
 def kidney_to_heart(renal: HallowRenalModel, MAP: float, CO: float,
-                    Pven: float) -> KidneyToHeartMessage:
+                    Pven: float,
+                    SVR_baseline: float = None) -> KidneyToHeartMessage:
     """
     Construct a Kidney->Heart message from renal model state.
 
@@ -1517,7 +1491,8 @@ def kidney_to_heart(renal: HallowRenalModel, MAP: float, CO: float,
     SVR computation (Section 3.3):
         SVR = (MAP - CVP) / CO
         SVR_ratio = SVR_current / SVR_baseline
-    where baseline is defined at normal hemodynamics (MAP=93, CVP=3, CO=5).
+    where SVR_baseline is computed from CircAdapt's actual baseline
+    hemodynamics at initialization.
 
     Parameters
     ----------
@@ -1529,31 +1504,26 @@ def kidney_to_heart(renal: HallowRenalModel, MAP: float, CO: float,
         Current cardiac output [L/min] (from Heart->Kidney message).
     Pven : float
         Current central venous pressure [mmHg] (from Heart->Kidney message).
+    SVR_baseline : float, optional
+        Baseline SVR from CircAdapt's healthy steady state [mmHg*min/L].
+        Computed once at simulation init from the first run_to_steady_state()
+        call, ensuring the ratio starts at exactly 1.0.
 
     Returns
     -------
     KidneyToHeartMessage
         Structured message carrying renal state to cardiac model.
     """
-    # CVP = central venous pressure, floored at 0.5 mmHg to prevent
-    # division issues and non-physiological negative values.
-    CVP = max(Pven, 0.5)
-
-    # Current systemic vascular resistance: SVR = (MAP - CVP) / CO
-    # This is the standard clinical SVR formula (in mmHg*min/L units).
-    # CO is floored at 0.3 L/min to prevent division by zero at
-    # extremely low cardiac output.
-    SVR_current = (MAP - CVP) / max(CO, 0.3)                       # Current SVR [mmHg*min/L]
-
-    # Baseline SVR at normal hemodynamics:
-    #   MAP=93 mmHg, CVP=3 mmHg, CO=5 L/min -> SVR = 90/5 = 18 mmHg*min/L
-    # This reference value is used to compute the dimensionless ratio
-    # that scales the CircAdapt ArtVen p0 parameter.
-    SVR_baseline = (93.0 - 3.0) / 5.0                              # Baseline SVR = 18 mmHg*min/L
-
+    # SVR_ratio is fixed at 1.0: the kidney does not independently change
+    # vascular resistance. Volume feedback is handled by PFC target_volume
+    # in apply_kidney_feedback(), and inflammatory resistance effects are
+    # handled by _pathology_p0_factor. Computing SVR from MAP/CO and
+    # feeding it back creates a positive feedback loop (high volume →
+    # high CO → low SVR_ratio → CircAdapt drops resistance → MAP drops
+    # → kidney retains more Na → death spiral).
     return KidneyToHeartMessage(
         V_blood=renal.V_blood,                                      # Current blood volume from renal model [mL]
-        SVR_ratio=SVR_current / SVR_baseline,                       # Dimensionless SVR change relative to healthy
+        SVR_ratio=1.0,                                               # Fixed: no renal resistance feedback
         GFR=renal.GFR,                                              # Current GFR for recording [mL/min]
     )
 
@@ -1933,9 +1903,15 @@ def run_coupled_simulation(
         print(f"  Mediator: Inflammatory layer ({'ODE' if use_ode else 'parametric'})")
     print("=" * 70)
 
+    # Compute SVR_baseline from CircAdapt's actual healthy steady state.
+    # This ensures SVR_ratio starts at exactly 1.0 at step 1, rather than
+    # being biased by a hardcoded (MAP=93, CVP=3, CO=5) assumption.
+    hemo_init = heart.run_to_steady_state()
+    SVR_baseline = (hemo_init['MAP'] - max(hemo_init['Pven'], 0.5)) / max(hemo_init['CO'], 0.3)
+
     # Track previous-step hemodynamics for ODE inflammatory model
     prev_EDP = 10.0    # baseline end-diastolic pressure [mmHg]
-    prev_MAP = 86.4    # baseline MAP [mmHg]
+    prev_MAP = hemo_init['MAP']  # actual CircAdapt baseline MAP [mmHg]
 
     # ══════════════════════════════════════════════════════════════════
     # MAIN COUPLING LOOP (Algorithm 1, Steps 0-9)
@@ -2064,7 +2040,7 @@ def run_coupled_simulation(
         # Package V_blood and SVR_ratio from the renal model into a
         # structured message for the cardiac model. SVR_ratio is
         # computed from the current MAP and CO.
-        k2h = kidney_to_heart(renal, h2k.MAP, h2k.CO, h2k.Pven)
+        k2h = kidney_to_heart(renal, h2k.MAP, h2k.CO, h2k.Pven, SVR_baseline)
         print(f"  [K->H]  V_blood={k2h.V_blood:.0f} mL   "
               f"SVR_ratio={k2h.SVR_ratio:.3f}   GFR={k2h.GFR:.1f}")
 
@@ -2075,7 +2051,7 @@ def run_coupled_simulation(
         # CircAdapt's SI unit system. SVR_ratio scales the ArtVen p0
         # parameter (composed with the inflammatory p0_factor).
         heart.apply_kidney_feedback(
-            V_blood_m3=k2h.V_blood * ML_TO_M3,     # Convert mL -> m^3 for CircAdapt
+            V_blood_mL=k2h.V_blood,                  # Total body blood volume [mL]
             SVR_ratio=k2h.SVR_ratio,                 # Dimensionless SVR change
         )
 
@@ -2127,6 +2103,13 @@ def run_coupled_simulation(
         hist.setdefault('RAAS_gain_factor', []).append(ist.RAAS_gain_factor)
         hist.setdefault('eta_PT_offset', []).append(ist.eta_PT_offset)
         hist.setdefault('MAP_setpoint_offset', []).append(ist.MAP_setpoint_offset)
+        # ODE inflammatory state variables
+        hist.setdefault('systemic_inflammatory_index', []).append(ist.systemic_inflammatory_index)
+        hist.setdefault('myocardial_fibrosis_volume', []).append(ist.myocardial_fibrosis_volume)
+        hist.setdefault('endothelial_dysfunction_index', []).append(ist.endothelial_dysfunction_index)
+        hist.setdefault('renal_tubulointerstitial_fibrosis', []).append(ist.renal_tubulointerstitial_fibrosis)
+        hist.setdefault('AGE_accumulation', []).append(ist.AGE_accumulation)
+        hist.setdefault('LVEDP', []).append(prev_EDP if prev_EDP is not None else 0.0)
 
         # ── Log this step to structured log file ───────────────────
         sim_logger.log_run(
